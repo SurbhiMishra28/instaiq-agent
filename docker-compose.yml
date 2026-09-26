@@ -1,0 +1,31 @@
+# Local full-stack run in Docker: FastAPI backend + React/Vite frontend.
+#   docker compose up --build
+#   Frontend: http://localhost:3000   Backend: http://localhost:8000
+# Real data only: without credentials the keyless ladder + real-Chrome stage
+# run; add tokens below (or a .env file next to this compose file) to enable
+# more providers. See backend/.env.example for the full list.
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      - LLM_MODEL=${LLM_MODEL:-nvidia/nemotron-3-super-120b-a12b:free}
+      - LLM_FALLBACK_BASE_URL=${LLM_FALLBACK_BASE_URL:-}
+      - LLM_FALLBACK_API_KEY=${LLM_FALLBACK_API_KEY:-}
+      - LLM_FALLBACK_MODEL=${LLM_FALLBACK_MODEL:-}
+      - APIFY_TOKEN=${APIFY_TOKEN:-}
+      - IG_RELAY_URL=${IG_RELAY_URL:-}
+      - IG_PROXY_URL=${IG_PROXY_URL:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

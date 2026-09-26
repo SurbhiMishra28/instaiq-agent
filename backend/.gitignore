@@ -1,0 +1,5 @@
+.vercel
+.env*
+data/collect/
+backend/rag_index.db
+*.db

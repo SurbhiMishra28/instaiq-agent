@@ -1,0 +1,83 @@
+import { defineConfig, loadEnv } from 'vite'
+import react from '@vitejs/plugin-react'
+import { VitePWA } from 'vite-plugin-pwa'
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const apiHost = env.VITE_API_HOST || 'localhost:8000'
+
+  return {
+    plugins: [
+      react(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        // Generate the service worker + manifest in dev too, so /manifest.webmanifest
+        // resolves instead of falling back to index.html (manifest parse errors).
+        devOptions: { enabled: true },
+        includeAssets: ['favicon.svg', 'icons/*.png'],
+        manifest: {
+          name: 'InstaIQ — AI Instagram Intelligence Agent',
+          short_name: 'InstaIQ',
+          description: 'Analyze any Instagram profile, auto-discover competitors, and get AI-written growth strategy.',
+          theme_color: '#4EC9FF',
+          background_color: '#0B1020',
+          display: 'standalone',
+          orientation: 'portrait-primary',
+          scope: '/',
+          start_url: '/',
+          icons: [
+            {
+              src: 'icons/icon-192.png',
+              sizes: '192x192',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: 'icons/icon-512-maskable.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'any maskable',
+            },
+          ],
+        },
+        workbox: {
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          runtimeCaching: [
+            {
+              urlPattern: new RegExp(`https?:\/\/(${apiHost.replace(':', '\\:')})\/.*`),
+              handler: 'NetworkFirst',
+              options: {
+                cacheName: 'api-cache',
+                expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 },
+                cacheableResponse: { statuses: [0, 200] },
+              },
+            },
+          ],
+        },
+      }),
+    ],
+    server: {
+      host: true,
+      port: 5173,
+      // Accept requests addressed to non-localhost hosts (deployed previews);
+      // localhost needs no entry.
+      allowedHosts: true,
+      // Same-origin API proxy: the UI calls `/api/...` on its own origin and
+      // vite forwards to the backend — no CORS, no per-host VITE_API_URL.
+      proxy: {
+        '/api': {
+          target: 'http://127.0.0.1:8000',
+          changeOrigin: true,
+          // Long analyses (fresh Instagram fetch + LLM chains) can take minutes.
+          timeout: 300000,
+          proxyTimeout: 300000,
+        },
+      },
+    },
+    preview: {
+      host: true,
+      port: 4173,
+      allowedHosts: true,
+    },
+  }
+})
