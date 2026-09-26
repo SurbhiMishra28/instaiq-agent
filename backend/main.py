@@ -13,6 +13,8 @@ except Exception:
     pass
 
 from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import FileResponse
+from pathlib import Path as _Path
 from types import SimpleNamespace
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -124,8 +126,20 @@ app.add_middleware(
 )
 
 
+# Single-service deploys (Docker/Render): FRONTEND_DIST points at the built
+# SPA (set by app_main.py before this import). When a build exists, "/" serves
+# the app instead of the JSON service banner.
+_FRONTEND_INDEX = (
+    _Path(os.getenv("FRONTEND_DIST", "")) / "index.html"
+    if os.getenv("FRONTEND_DIST")
+    else None
+)
+
+
 @app.get("/")
 def root():
+    if _FRONTEND_INDEX is not None and _FRONTEND_INDEX.is_file():
+        return FileResponse(_FRONTEND_INDEX)
     return {
         "status": "ok",
         "service": "insta-intel-agent",
