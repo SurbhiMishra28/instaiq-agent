@@ -11,7 +11,7 @@ Every number served comes from a real source:
   - Provider #2: keyless HTTP ladder (web_profile_info + GraphQL feed + HTML)
     opens instagram.com and reads Instagram's own web_profile_info JSON
     from inside the page (same origin, cookies and TLS fingerprint as the
-    site's frontend). No token, no login, no relay.
+    site's frontend). No token, no login.
   - Provider #3: keyless HTTP ladder (direct web_profile_info GET with
     bootstrap cookies + CDP-rendered page GraphQL capture).
 
@@ -1258,17 +1258,6 @@ _DIRECT_HEADERS = {
 # live fetching on those hosts. Leave unset locally.
 _IG_PROXY_URL = (os.getenv("IG_PROXY_URL") or "").strip() or None
 
-# Relay-ladder cooldown: after a full pass where every public relay failed,
-# skip the ladder entirely for this window (dead-relay latency is up to
-# ~25s x N relays — pointless to re-pay on every throttled request).
-_RELAY_DOWN_COOLDOWN = float(os.getenv("IG_RELAY_COOLDOWN", "300"))
-_relay_down_until = 0.0
-
-# Self-hosted keyless relay (e.g. the free Cloudflare Worker in
-# infra/ig-relay-worker/): tried FIRST when set, before the public relays.
-# It is the user's own infrastructure — a plain URL, no API token — and its
-# egress IPs are Cloudflare's, which Instagram serves logged-out pages to.
-_SELF_RELAY_URL = (os.getenv("IG_RELAY_URL") or "").strip().rstrip("/")
 
 
 def _ig_httpx_proxy() -> Optional[str]:
@@ -1728,190 +1717,61 @@ def _parse_chrome_payload(data: Dict[str, Any], username: str) -> Optional[Profi
     return profile
 
 
-async def _fetch_chrome_via_function(username: str) -> Optional[ProfileData]:
-    """Remote variant: call the deployed headless-Chrome render function
-    (IG_CHROME_URL, e.g. https://<backend>/api/chrome) and parse its JSON
-    {ok, html, user_id}. Used on hosts with no local Chrome (serverless)."""
-    base = (os.getenv("IG_CHROME_URL") or "").strip().rstrip("/")
-    if not base:
-        return None
-    url = f"{base}?username={quote(username, safe='')}"
 
-    def _run() -> Optional[Dict[str, Any]]:
-        with httpx.Client(timeout=90.0, follow_redirects=True) as client:
-            resp = client.get(url)
-        if resp.status_code != 200:
-            return None
-        return resp.json()
-
-    try:
-        data = await asyncio.wait_for(asyncio.to_thread(_run), timeout=95.0)
-    except (asyncio.TimeoutError, OSError, Exception) as e:
-        print(f"[chrome-fn] @{username}: render fn failed: {str(e)[:120]}")
-        return None
-    if not isinstance(data, dict) or not data.get("ok"):
-        kind = (data or {}).get("kind") if isinstance(data, dict) else None
-        if kind == "notfound":
-            raise ValueError(
-                f"Instagram profile '@{username}' not found (remote Chrome "
-                "render returned no profile data). Check the spelling."
-            )
-        print(f"[chrome-fn] @{username}: render failed ({kind}: {str((data or {}).get('error'))[:120]})")
-        return None
-    profile = _parse_chrome_payload(data, username)
-    if profile is not None:
-        record_fetch_event(
-            "ok",
-            f"@{username} via remote Chrome render (keyless, {len(profile.recent_posts)} posts)",
-        )
-    return profile
-
-
-def _home_relay_conf() -> Optional[tuple]:
-    """(base_url, token) of the user's own-PC relay when configured."""
-    base = (os.getenv("IG_HOME_RELAY_URL") or "").strip().rstrip("/")
-    token = (os.getenv("IG_HOME_RELAY_TOKEN") or "").strip()
-    if not base:
-        return None
-    return base, token
-
-
-async def _fetch_chrome_via_home_relay(username: str) -> Optional[ProfileData]:
-    """Provider #2c: ask the user's own PC to render the profile — real
-    Chrome on a residential IP, exposed fetch-only behind a token by
-    backend/tunnel.py. Instagram hard-blocks datacenter egress (Vercel,
-    Workers, public relays), so the home relay is the only free unblocked
-    path; it runs the exact same keyless render as the local backend."""
-    conf = _home_relay_conf()
-    if conf is None:
-        return None
-    base, token = conf
-    url = f"{base}/?username={quote(username, safe='')}"
-
-    def _run() -> Optional[Dict[str, Any]]:
-        headers = {"x-relay-token": token} if token else {}
-        with httpx.Client(timeout=100.0, follow_redirects=True) as client:
-            resp = client.get(url, headers=headers)
-        if resp.status_code == 401:
-            print("[home-relay] token rejected — update IG_HOME_RELAY_TOKEN on this host")
-            return None
-        if resp.status_code == 404:
-            return {"ok": False, "kind": "notfound"}
-        if resp.status_code != 200:
-            print(f"[home-relay] HTTP {resp.status_code} (relay offline? rerun backend/tunnel.py)")
-            return None
-        return resp.json()
-
-    try:
-        data = await asyncio.wait_for(asyncio.to_thread(_run), timeout=110.0)
-    except (asyncio.TimeoutError, OSError, Exception) as e:
-        print(f"[home-relay] @{username}: relay unreachable: {str(e)[:120]}")
-        return None
-    if not isinstance(data, dict) or not data.get("ok"):
-        kind = (data or {}).get("kind") if isinstance(data, dict) else None
-        if kind == "notfound":
-            raise ValueError(
-                f"Instagram profile '@{username}' not found (home relay "
-                "render returned no profile data). Check the spelling."
-            )
-        print(f"[home-relay] @{username}: render failed ({kind}: "
-              f"{str((data or {}).get('error'))[:120]})")
-        return None
-    profile = _parse_chrome_payload(data, username)
-    if profile is not None:
-        record_fetch_event(
-            "ok",
-            f"@{username} via home-relay render (keyless, "
-            f"{len(profile.recent_posts)} posts)",
-        )
-    return profile
 
 
 async def _fetch_chrome_profile(username: str) -> Optional[ProfileData]:
-    """Provider #2b: render instagram.com/<handle>/ in real Chrome (keyless)
-    and parse the real page. Local puppeteer-core+Chrome first; hosts without
-    Chrome (Vercel serverless) try the deployed headless-Chrome function
-    (IG_CHROME_URL, backed by @sparticuz/chromium) and finally the user's own
-    PC relay (IG_HOME_RELAY_URL — the only free egress Instagram doesn't
-    block). Returns None (never raises for fetch-level problems) so the
-    ladder's honest error still fires when every render path is blocked.
-    """
+    """Provider #2b: render instagram.com/<handle>/ in real local Chrome
+    (keyless) and parse the real page. Only runs where Chrome + Node +
+    puppeteer-core exist (the owner's machine); hosts without them skip
+    this stage gracefully."""
     if not CHROME_FETCH_ENABLED:
         return None
     chrome = _find_chrome()
     if not chrome:
-        # No local browser (serverless hosts). The home relay is tried FIRST
-        # when configured: it is the only egress Instagram doesn't block, and
-        # the serverless budget (maxDuration) is too tight to burn on render
-        # fns that are guaranteed to hit the login-wall.
-        if _home_relay_conf() is not None:
-            profile = await _fetch_chrome_via_home_relay(username)
-            if profile is not None:
-                return profile
-            # Relay down this round — still try the deployed render fn below.
-        return await _fetch_chrome_via_function(username)
+        print("[chrome] no Chrome executable found - skipping render stage")
+        return None
     if not os.path.isfile(_CHROME_HELPER):
-        print("[chrome] chrome_fetch.cjs missing — skipping local render")
+        print("[chrome] chrome_fetch.cjs missing - skipping local render")
         return None
-    node = shutil.which("node") or shutil.which("node.exe")
+    node = shutil.which("node")
     if not node:
-        print("[chrome] node not on PATH — skipping Chrome stage")
+        print("[chrome] node not on PATH - skipping Chrome stage")
         return None
-    node_modules = _find_puppeteer()
-    if not node_modules:
-        print("[chrome] puppeteer-core not installed — skipping stage")
+    try:
+        import subprocess as _sp
+    except Exception:
         return None
-
     env = dict(os.environ)
     env["IG_CHROME_PATH"] = chrome
-    env["NODE_PATH"] = os.path.abspath(node_modules)
     cmd = [node, _CHROME_HELPER, f"--url=https://www.instagram.com/{username}/"]
 
-    def _run() -> tuple:
-        proc = subprocess.run(
-            cmd, capture_output=True, timeout=int(_CHROME_FETCH_TIMEOUT) + 10,
-            env=env, cwd=os.path.dirname(_CHROME_HELPER),
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-
-    try:
-        rc, stdout, stderr = await asyncio.wait_for(
-            asyncio.to_thread(_run), timeout=_CHROME_FETCH_TIMEOUT
-        )
-    except (asyncio.TimeoutError, subprocess.TimeoutExpired, OSError) as e:
-        print(f"[chrome] @{username}: helper failed to run: {str(e)[:120]}")
-        return None
-
-    try:
-        data = json.loads(stdout.decode("utf-8", errors="replace"))
-    except Exception:
-        tail = (stderr or b"").decode("utf-8", errors="replace")[-200:]
-        print(f"[chrome] @{username}: unparseable helper output (rc={rc}) {tail}")
-        return None
-    if not data.get("ok"):
-        kind = data.get("kind") or "error"
-        # A login-walled render is 'blocked' (throttled IP); a page with no
-        # profile data at all is treated as a missing handle.
-        if kind == "notfound":
-            raise ValueError(
-                f"Instagram profile '@{username}' not found (Chrome render "
-                "returned no profile data). Check the spelling of the handle."
+    def _run() -> Optional[Dict[str, Any]]:
+        try:
+            proc = _sp.run(
+                cmd, capture_output=True, timeout=int(_CHROME_FETCH_TIMEOUT) + 10,
+                env=env, cwd=os.path.dirname(_CHROME_HELPER),
             )
-        print(f"[chrome] @{username}: render failed ({kind}: {str(data.get('error'))[:120]})")
-        return None
+            return json.loads(proc.stdout.decode("utf-8", "replace") or "null")
+        except Exception as e:
+            print(f"[chrome] render failed: {type(e).__name__}: {str(e)[:120]}")
+            return None
 
-    # Best source: the profile API response captured from INSIDE the page
-    # (real browser context), else the rendered HTML; feed posts best-effort.
+    try:
+        data = await asyncio.wait_for(asyncio.to_thread(_run), timeout=_CHROME_FETCH_TIMEOUT)
+    except asyncio.TimeoutError:
+        print(f"[chrome] @{username}: render timed out")
+        return None
+    if not isinstance(data, dict) or not data.get("ok"):
+        kind = (data or {}).get("kind", "unknown") if isinstance(data, dict) else "no-json"
+        print(f"[chrome] @{username}: render failed ({kind}: {str((data or {}).get('error'))[:120]})")
+        return None
     profile = _parse_chrome_payload(data, username)
-    if profile is None:
-        print(f"[chrome] @{username}: render ok but no parseable profile data")
-        return None
-
-    record_fetch_event(
-        "ok",
-        f"@{username} via real-Chrome render (keyless, "
-        f"{len(profile.recent_posts)} posts)",
-    )
+    if profile is not None:
+        record_fetch_event(
+            "ok",
+            f"@{username} via local Chrome render (keyless, {len(profile.recent_posts)} posts)",
+        )
     return profile
 
 
@@ -2030,74 +1890,6 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
         record_fetch_event("ok", f"@{username} stats-only via HTML floor (no posts)")
         return html_floor
 
-    # Fallback 2: keyless public-relay ladder — DIFFERENT egress IPs.
-    # Datacenter hosts (Vercel/Render/Railway) get Instagram's own endpoints
-    # hard-throttled (401/429 on every call regardless of headers) while the
-    # same requests succeed from residential IPs. A CORS/reader relay fetches
-    # instagram.com FROM THE RELAY'S IPs and hands back the page HTML, which
-    # _extract_profile_from_html already parses (exact GraphQL-blob stats +
-    # embedded posts when present). No key, no login, no browser. Each relay
-    # failing just moves to the next; when every relay fails the request
-    # still fails honestly below instead of ever serving simulated data.
-    #
-    # _relay_down_until: when a full relay pass fails, skip the ladder for a
-    # cooldown window so throttled periods don't pay dead-relay latency on
-    # every request.
-    global _relay_down_until
-    relay_floor: Optional[ProfileData] = None  # real stats, no posts
-    if time.monotonic() >= _relay_down_until:
-        ig_page = f"https://www.instagram.com/{username}/"
-        relay_targets: Tuple[Tuple[str, str, dict], ...] = (
-            ("api.allorigins.win",
-             "https://api.allorigins.win/raw?url=" + quote(ig_page, safe=""), {}),
-            ("corsproxy.io",
-             "https://corsproxy.io/?url=" + quote(ig_page, safe=""), {}),
-            ("r.jina.ai",
-             f"https://r.jina.ai/{ig_page}", {"x-return-format": "html"}),
-        )
-        if _SELF_RELAY_URL:
-            relay_targets = (
-                ("self-relay", f"{_SELF_RELAY_URL}/?url={quote(ig_page, safe='')}", {}),
-            ) + relay_targets
-        for relay_host, relay_url, *extra_headers in relay_targets:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=max(_DIRECT_TIMEOUT, 25), follow_redirects=True,
-                    proxy=_ig_httpx_proxy(),
-                ) as client:
-                    rresp = await client.get(relay_url, headers={
-                        "user-agent": _DIRECT_HEADERS["user-agent"],
-                        "accept-language": "en-US,en;q=0.9",
-                        **(extra_headers[0] if extra_headers else {}),
-                    })
-            except httpx.HTTPError as e:
-                last_err = f"{last_err}; relay {relay_host} failed: {str(e)[:80]}"
-                continue
-            if rresp.status_code != 200:
-                last_err = f"{last_err}; relay {relay_host} got HTTP {rresp.status_code}"
-                continue
-            # The self-relay reports Instagram's true status even on HTTP 200
-            # (empty body) — surface it so trails show WHY the page was empty.
-            relay_status = rresp.headers.get("x-relay-status")
-            rprofile = _extract_profile_from_html(rresp.text, username)
-            if rprofile is None:
-                note = f" (upstream {relay_status})" if relay_status and relay_status != "200" else ""
-                last_err = f"{last_err}; relay {relay_host} page had no parseable profile{note}"
-                continue
-            if rprofile.recent_posts:
-                perf.stage("relay HTML has posts")
-                record_fetch_event("ok", f"@{username} via keyless relay {relay_host} (stats+posts)")
-                return rprofile
-            if relay_floor is None:
-                relay_floor = rprofile  # real stats without posts — keep as floor
-            last_err = f"{last_err}; relay {relay_host} served stats without posts"
-        if relay_floor is None:
-            _relay_down_until = time.monotonic() + _RELAY_DOWN_COOLDOWN
-
-    if relay_floor is not None:
-        record_fetch_event("ok", f"@{username} stats-only via keyless relay floor (no posts)")
-        return relay_floor
-
     # Fallback 3: real-Chrome render (keyless). Instagram serves the real
     # logged-out profile page to actual browsers even when plain-HTTP callers
     # are hard-throttled (401/login-wall): exact stats come from the embedded
@@ -2118,9 +1910,8 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
         f"(last HTTP status {last_status or 'n/a'}"
         f"{'; ' + last_err if last_err else ''}) — Instagram is rate-limiting "
         "or blocking this host's IPs (expected on Vercel/Render datacenter "
-        "ranges). Token-free fix: deploy the free Cloudflare Worker relay "
-        "(infra/ig-relay-worker/) and set IG_RELAY_URL. Other fixes: "
-        "IG_PROXY_URL (residential proxy), an Apify token, or "
+        "ranges). Fixes: IG_PROXY_URL (residential proxy), an Apify "
+        "token, or "
         "IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID (official Graph API) — "
         "simulated data is never served."
     )
@@ -2664,7 +2455,7 @@ def diagnostics() -> dict:
     """
 
     return {
-        "fetch_mode": "http-only (no browser in the fetch path)",
+        "fetch_mode": "http-only keyless ladder (+local Chrome stage when present)",
         "providers": {
             "apify_tokens_configured": len(APIFY_TOKENS),
             "graph_api_configured": _has_graph_credentials(),
@@ -2674,8 +2465,6 @@ def diagnostics() -> dict:
         "env": {
             "ig_fetch_mode": os.getenv("IG_FETCH_MODE", "http"),
             "ig_permalink_posts": os.getenv("IG_PERMALINK_POSTS", "12"),
-            "self_relay_configured": bool(_SELF_RELAY_URL),
-            "relay_cooldown_active": time.monotonic() < _relay_down_until,
         },
         "recent_fetch_events": list(_FETCH_EVENTS),
     }

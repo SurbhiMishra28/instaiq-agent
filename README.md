@@ -170,7 +170,7 @@ the built frontend — no CORS setup, no second service.
    does everything), or New → Web Service → runtime **Docker**.
 3. Set the env vars (see `ENV_VARS.md`):
    `LLM_API_KEY` + `TAVILY_API_KEY` (recommended), `APIFY_TOKEN` optional,
-   `IG_PROXY_URL`/`IG_RELAY_URL` optional. Mark keys as secret.
+   `IG_PROXY_URL` optional. Mark keys as secret.
 4. Deploy → one URL like `https://instaiq.onrender.com` (app + API together).
 
 **Recommended for Render: set `IG_PROXY_URL`.** Instagram hard-blocks
@@ -179,16 +179,9 @@ datacenter IPs (Render/Railway/Fly get 401/429 on every call). Setting
 Instagram request through it and restores live fetching. Locally, no proxy
 is needed.
 
-**Free token-free alternative: your own Cloudflare Worker relay.** Deploy
-`infra/ig-relay-worker/` (one command: `npx wrangler deploy`, free tier =
-100k req/day) and set the backend env
-`IG_RELAY_URL=https://ig-relay.<you>.workers.dev`. The fetch ladder tries
-it FIRST whenever Instagram throttles the host's IP — see
-`infra/ig-relay-worker/README.md`.
-
 **Separate frontend → Vercel/Netlify (optional):** import the repo with
 root directory `frontend`, build `npm run build`, output `dist`, and set
-`VITE_API_URL=https://<your-backend-url>`. Only needed if you'd rather host
+`VITE_API_URL=https://<your-render-url>`. Only needed if you'd rather host
 the UI separately instead of using the single-service deploy above.
 
 **Alternative — single-host deploy (Railway/a VPS):** `docker compose up
