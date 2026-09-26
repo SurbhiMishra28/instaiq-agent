@@ -1837,6 +1837,128 @@ async def ai_status():
     return ai_engine.llm_status()
 
 
+@app.get("/api/graph-status")
+async def graph_status():
+    """Live Graph API self-test for one-time setup debugging.
+
+    Validates the configured IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID end to
+    end: token validity (/me/accounts), account readability (own profile
+    fields), and the exact business_discovery call shape the fetch ladder
+    uses. Reports a human 'fix' hint at the first failing stage instead of
+    a generic error — so setup never requires guessing.
+    """
+    import httpx as _httpx
+
+    token = scraper.IG_ACCESS_TOKEN
+    ig_id = scraper.IG_BUSINESS_ACCOUNT_ID
+    out: Dict[str, Any] = {
+        "configured": bool(token and ig_id),
+        "token_preview": (f"{token[:10]}…{token[-4:]} ({len(token)} chars)") if token else "",
+        "ig_business_account_id": ig_id or "",
+        "graph_version": scraper.IG_GRAPH_VERSION,
+        "pages_seen": None,
+        "ig_account": None,
+        "business_discovery_selftest": None,
+        "verdict": "not-configured",
+        "fix": None,
+    }
+    if not (token and ig_id):
+        out["fix"] = (
+            "Add IG_ACCESS_TOKEN (the never-expiring Page token) and "
+            "IG_BUSINESS_ACCOUNT_ID (instagram_business_account.id) in the "
+            "Render Environment tab, then wait for the redeploy to finish."
+        )
+        return out
+
+    def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"https://graph.facebook.com/{scraper.IG_GRAPH_VERSION}/{path}"
+        params = {**params, "access_token": token}
+        with _httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            resp = client.get(url, params=params)
+        try:
+            return resp.json()
+        except Exception:
+            return {"error": {"message": f"HTTP {resp.status_code} non-JSON response"}}
+
+    # Stage 1 — token validity + Page visibility (pages_show_list).
+    me_accounts = await asyncio.to_thread(_get, "me/accounts", {"fields": "id,name,access_token,instagram_business_account{id,username,followers_count,media_count}", "limit": 50})
+    if isinstance(me_accounts.get("error"), dict):
+        err = me_accounts["error"]
+        code = err.get("code")
+        out["verdict"] = "token-invalid"
+        out["fix"] = (
+            "Token expired or invalid (code 190) — regenerate: short token in "
+            "Graph API Explorer with YOUR app selected, exchange to long-lived, "
+            "then take the PAGE token from /me/accounts."
+            if code == 190 else
+            f"Graph API error (code {code}): {str(err.get('message'))[:160]}"
+        )
+        return out
+
+    pages = me_accounts.get("data") or []
+    out["pages_seen"] = len(pages)
+    if not pages:
+        out["verdict"] = "no-pages-visible"
+        out["fix"] = (
+            "Token works but sees no Pages: grant pages_show_list (with YOUR "
+            "app selected in Graph API Explorer), be admin of the Page, and "
+            "retry — or the Page was created seconds ago (wait and retry)."
+        )
+        return out
+
+    # Stage 2 — find the configured IG account among the token's Pages.
+    match = None
+    for page in pages:
+        iga = page.get("instagram_business_account") or {}
+        if str(iga.get("id")) == str(ig_id):
+            match = iga
+            break
+    if match is None:
+        out["verdict"] = "account-id-mismatch"
+        out["fix"] = (
+            "IG_BUSINESS_ACCOUNT_ID does not match any Page linked to this "
+            "token. Copy the id EXACTLY from /me/accounts → "
+            "instagram_business_account.id (link the Page to Instagram first "
+            "if the field is missing)."
+        )
+        return out
+
+    out["ig_account"] = {
+        "id": match.get("id"),
+        "username": match.get("username"),
+        "followers_count": match.get("followers_count"),
+        "media_count": match.get("media_count"),
+    }
+
+    # Stage 3 — production-shape self-test: business_discovery on the OWN
+    # username (the same call shape used for any target handle).
+    username = match.get("username")
+    if username:
+        fields = (
+            f"business_discovery.username({username})"
+            "{biography,followers_count,media_count}"
+        )
+        bd = await asyncio.to_thread(_get, ig_id, {"fields": fields})
+        if isinstance(bd.get("error"), dict):
+            err = bd["error"]
+            out["verdict"] = "business-discovery-failed"
+            out["fix"] = f"business_discovery error (code {err.get('code')}): {str(err.get('message'))[:160]}"
+        else:
+            bd_data = bd.get("business_discovery") or {}
+            out["business_discovery_selftest"] = {
+                "ok": bool(bd_data),
+                "followers_count": bd_data.get("followers_count"),
+                "media_count": bd_data.get("media_count"),
+            }
+            out["verdict"] = "ready" if bd_data else "business-discovery-empty"
+            if not bd_data:
+                out["fix"] = "business_discovery returned empty — confirm the account is a Business/Creator (professional) account."
+    else:
+        out["verdict"] = "ready"
+
+    return out
+
+
 @app.get("/api/diagnostics")
 async def fetch_diagnostics():
     """Cloud-debug snapshot: fetch-layer configuration (HTTP-only, no
