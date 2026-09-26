@@ -1775,6 +1775,133 @@ async def _fetch_chrome_profile(username: str) -> Optional[ProfileData]:
     return profile
 
 
+# ---------------------------------------------------------------------------
+# Provider #2d - Tavily page-extract floor (cloud-friendly)
+#
+# Tavily's extractor (https://tavily.com, the same free key that powers web
+# search) runs from infrastructure that Instagram serves logged-out pages
+# to - so when THIS host's own IPs are hard-throttled (Render/Vercel
+# datacenter ranges), Tavily still returns the profile page. The markdown
+# carries the REAL profile header: followers, following, full name, bio.
+# Posts are not included (no engagement counts on the page markdown), so
+# this rung yields an honest stats-floor row: real numbers, no posts,
+# flagged by the usual data-quality warning, and self-heals later when a
+# fuller provider (Graph API / a residential IP) can run. Costs ~1-2 Tavily
+# credits per attempt; failures return None and the request fails honestly.
+# ---------------------------------------------------------------------------
+
+_TAVILY_EXTRACT_ENDPOINT = "https://api.tavily.com/extract"
+
+
+def _parse_kmb_to_int(text: str) -> int:
+    """'268M' -> 268_000_000, '1.2M' -> 1_200_000, '850K' -> 850_000,
+    '743' -> 743. Returns 0 for unparseable input."""
+    m = re.search(r"([\d.,]+)\s*([KMBkmb]?)", (text or "").strip())
+    if not m:
+        return 0
+    try:
+        val = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+    mult = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(
+        m.group(2).upper(), 1
+    )
+    return int(val * mult)
+
+
+def _parse_tavily_profile_markdown(raw: str, username: str) -> Optional[ProfileData]:
+    """Tavily extract markdown -> stats-floor ProfileData (no posts).
+
+    Observed page shape (logged-out profile, markdown-extracted):
+        ## natgeo
+        * [268M followers](#)
+        * [194 following](#)
+        National Geographic
+        [natgeo](https://www.threads.com/@natgeo...)
+        Step into wonder and find your inner explorer ...
+        [![<post alt text>](<img>)](/natgeo/reel/<code>/) ...
+    Returns None when the page is not a parseable profile for `username`
+    (login wall, missing handle, challenge page) - never fabricates stats.
+    """
+    if not raw:
+        return None
+    m = re.search(r"^##\s+([A-Za-z0-9._]+)\s*$", raw, re.M)
+    if not m or m.group(1).lower() != (username or "").lower():
+        return None  # wrong/absent handle -> not a usable profile page
+
+    followers = following = 0
+    fm = re.search(r"\[\s*([\d.,]+\s*[KMBkmb]?)\s+followers?\s*\]", raw, re.I)
+    if fm:
+        followers = _parse_kmb_to_int(fm.group(1))
+    fg = re.search(r"\[\s*([\d.,]+\s*[KMBkmb]?)\s+following\s*\]", raw, re.I)
+    if fg:
+        following = _parse_kmb_to_int(fg.group(1))
+    if followers <= 0:
+        return None  # no follower stat = nothing honest to serve
+
+    # Header region: everything before the first post image block.
+    head_end = raw.find("[![")
+    head = raw[:head_end] if head_end > 0 else raw[:2000]
+    plain = [
+        ln.strip()
+        for ln in head.splitlines()
+        if ln.strip()
+        and not ln.strip().startswith(("[", "*", "#", "!", "http"))
+        and not ln.strip().lower().startswith(("log in", "sign up"))
+    ]
+    full_name = plain[0][:80] if plain else ""
+    bio = " ".join(plain[1:]).strip()[:400] if len(plain) > 1 else ""
+
+    return ProfileData(
+        username=m.group(1),
+        full_name=full_name,
+        bio=bio,
+        followers=followers,
+        following=following,
+        posts_count=0,
+        is_verified=False,
+        is_business=False,
+        category=None,
+        recent_posts=[],
+    )
+
+
+def _tavily_floor_sync(username: str) -> Optional[ProfileData]:
+    """Blocking Tavily extract attempt -> stats-floor ProfileData | None."""
+    key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    if not key:
+        return None
+    try:
+        with httpx.Client(timeout=45.0, follow_redirects=True) as client:
+            resp = client.post(
+                _TAVILY_EXTRACT_ENDPOINT,
+                json={
+                    "api_key": key,
+                    "urls": [f"https://www.instagram.com/{username}/"],
+                    "extract_depth": "advanced",
+                },
+            )
+        resp.raise_for_status()
+        results = (resp.json() or {}).get("results") or []
+        raw = (results[0].get("raw_content") or "") if results else ""
+        profile = _parse_tavily_profile_markdown(raw, username)
+        if profile is not None:
+            record_fetch_event(
+                "ok",
+                f"@{username}: Tavily extract floor parsed "
+                f"({profile.followers:,} followers)",
+            )
+        else:
+            record_fetch_event(
+                "blocked",
+                f"@{username}: Tavily extract returned no parseable profile",
+            )
+        return profile
+    except Exception as e:
+        print(f"[tavily-floor] @{username}: {type(e).__name__}: {str(e)[:120]}")
+        return None
+
+
 async def _fetch_direct_profile(username: str) -> ProfileData:
     """Provider #2: keyless GET to Instagram's web_profile_info endpoint.
 
@@ -1900,6 +2027,15 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
     if chrome_profile is not None:
         perf.stage("real-Chrome render OK")
         return chrome_profile
+
+    # Fallback 4: Tavily extract floor - the cloud-host rung. When every
+    # direct layer is throttled (datacenter IPs) and no local Chrome exists,
+    # Tavily's extractor still gets the real profile header. Stats-only row:
+    # honest data-quality warning + later self-heal, never fabricated stats.
+    tavily_floor = await asyncio.to_thread(_tavily_floor_sync, username)
+    if tavily_floor is not None:
+        perf.stage("tavily extract floor OK")
+        return tavily_floor
 
     record_fetch_event(
         "blocked",
