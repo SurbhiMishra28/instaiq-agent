@@ -2187,7 +2187,10 @@ def _search_terms_for(username: str, profile_item: Optional[Dict[str, Any]]) -> 
     for w in raw:
         w = w.strip("#|.,!?").strip()
         if (
-            len(w) >= 4
+            # 3+ chars: keeps valuable short niche words (gym, ski, art)
+            # that materially improve web-search discovery; still filters
+            # the noise (of, the, and, with...).
+            len(w) >= 3
             and w.lower() not in _STOPWORDS
             and not w.startswith(("@", "http", "www"))
             and w.isalpha()
@@ -2356,19 +2359,31 @@ async def discover_related_profiles(username: str, limit: int = 30) -> List[Dict
     # research completes with ZERO provider calls — the LLM does the
     # selection and analysis, the numbers come from previously fetched
     # real data. Tried before ANY paid provider run.
-    local = await _local_discover(username, limit)
-    if local:
-        await asyncio.to_thread(_cache_set, cache_key, local)
-        return local
+    # NOTE: local mining alone is niche-blind (it returns whatever accounts
+    # this app has analyzed, regardless of topic), so it only SEEDS the
+    # candidate pool — the Tavily web-search layer below tops it up with
+    # topical rivals whenever it is configured.
+    candidates: List[Dict[str, Any]] = list(await _local_discover(username, limit) or [])
 
-    # No discovery actor token: try the Tavily web-search discovery layer
-    # (zero Apify credits — real niche competitor handles mined from live
-    # web results), then give up with whatever cache mining found. Discovery
-    # itself never raises — return what we have.
+    # Tavily web-search discovery (zero Apify credits — real niche
+    # competitor handles mined from live web results). Runs even when local
+    # mining found something, and takes priority in the pool: topical
+    # relevance beats "account the app happened to see before". Discovery
+    # itself never raises.
     if not APIFY_TOKENS:
         try:
             import websearch
-            terms = _search_terms_for(username, None)
+            # A cached real snapshot of THIS account (fetched moments ago in
+            # the pipeline) carries its bio/full name — a far better niche
+            # signal for web discovery than the username stem alone.
+            cached = await asyncio.to_thread(_disk_profile_get, username)
+            item = None
+            if cached is not None:
+                item = {
+                    "biography": cached.bio or "",
+                    "fullName": cached.full_name or "",
+                }
+            terms = _search_terms_for(username, item)
             if not terms:
                 terms = [username.replace("_", " ").replace(".", " ").strip() or username]
             web_cands = await asyncio.to_thread(
@@ -2377,13 +2392,12 @@ async def discover_related_profiles(username: str, limit: int = 30) -> List[Dict
         except Exception:
             web_cands = []
         if web_cands:
-            fresh = [
-                c for c in web_cands
-                if c["username"].lower() not in {x["username"].lower() for x in candidates}
-            ]
-            candidates.extend(fresh[: max(0, limit - len(candidates))])
-            if candidates:
-                await asyncio.to_thread(_cache_set, cache_key, candidates)
+            have = {c["username"].lower() for c in candidates}
+            have.add(username.lower())
+            fresh = [c for c in web_cands if c["username"].lower() not in have]
+            candidates = fresh + candidates  # web-first: topical rivals lead
+        if candidates:
+            await asyncio.to_thread(_cache_set, cache_key, candidates)
         return candidates
 
     profile_item: Optional[Dict[str, Any]] = None

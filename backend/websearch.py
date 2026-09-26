@@ -188,17 +188,20 @@ def discover_competitors(
         })
         return len(found) >= limit
 
+    # Up to 3 Instagram-scoped probes (result URLs ARE profile links) plus
+    # one organic listicle probe. Scoped searches are high-variance per
+    # query — several small probes beat one big one.
     probes: List[Dict[str, Any]] = [
-        {"q": f"{base} instagram profile", "domains": ["instagram.com"]},
+        {"q": f"{base} instagram", "domains": ["instagram.com"], "n": 8},
         {"q": f"top {base} instagram accounts to follow"},
     ]
     if len(terms) > 1:
-        probes.append({"q": f"best {terms[1]} instagram influencers"})
+        probes.insert(1, {"q": f"{terms[1]} instagram", "domains": ["instagram.com"], "n": 8})
 
-    for probe in probes[:3]:
+    for probe in probes[:4]:
         try:
             if probe.get("domains") and _tavily_key():
-                results = _tavily_search(probe["q"], 8, probe["domains"])
+                results = _tavily_search(probe["q"], probe.get("n", 8), probe["domains"])
             else:
                 results = search_web(probe["q"], 6)
         except Exception:
