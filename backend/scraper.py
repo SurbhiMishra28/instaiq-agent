@@ -232,6 +232,10 @@ _profile_cache: Dict[str, tuple] = {}  # username -> (monotonic_ts, ProfileData)
 # API (the keyless HTTP ladder records and honors this).
 _refresh_inflight: set = set()
 _API_BLOCK_COOLDOWN = float(os.getenv("IG_API_BLOCK_COOLDOWN", "600"))
+# Monotonic deadline until which the plain-HTTP web_profile_info call is
+# skipped (set when Instagram answers 401/403/429). Initialized at module
+# level so every reader (get_profile provider order) can check it safely.
+_api_block_until: float = 0.0
 _related_cache: Dict[str, tuple] = {}  # username -> (monotonic_ts, List[dict])
 _selfheal_attempted: set = set()  # handles whose stats-only cache row got one refetch try
 _CACHE_LOCK = asyncio.Lock()
@@ -1622,6 +1626,17 @@ def _gql_feed_sync(user_id: str, first: int = 12) -> Optional[Any]:
         return None
 
 
+def _posts_need_enrichment(posts: List["Post"]) -> bool:
+    """True when the GraphQL feed enrichment call could add real data, i.e.
+    NO post carries a like count (all-zero engagement). If any post already
+    has likes, the payload includes real engagement and the extra round-trip
+    (up to 12s) would buy nothing."""
+    for p in posts or []:
+        if p.likes > 0:
+            return False
+    return bool(posts)  # posts exist but none has a like count -> enrich
+
+
 async def _enrich_with_graphql_feed(profile: ProfileData, user_id: str) -> ProfileData:
     """Attach real post engagement (likes/comments/views/timestamps) from the
     classic GraphQL feed query to a profile fetched by the keyless fallback.
@@ -1978,10 +1993,19 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
             # values from the posts' permalink pages before caching.
             perf.stage("web_profile_info OK")
             record_fetch_event("ok", f"@{username} via web_profile_info (keyless HTTP)")
-            result = await _enrich_with_graphql_feed(
-                profile, str(user.get("pk") or user.get("id") or "")
-            )
-            perf.stage("post enrichment done")
+            # Skip the GraphQL feed enrichment round-trip (up to 12s) when the
+            # web_profile_info payload already carries real engagement: modern
+            # xdt nodes include likes/comments, so the extra call only paid
+            # latency with no data gain in that case. Runs only when ANY post
+            # is missing likes — stripped/hidden likes still get enriched.
+            if _posts_need_enrichment(profile.recent_posts):
+                result = await _enrich_with_graphql_feed(
+                    profile, str(user.get("pk") or user.get("id") or "")
+                )
+                perf.stage("post enrichment done")
+            else:
+                perf.stage("post enrichment skipped (likes already present)")
+                result = profile
             return result
 
     # Fallback 1: plain-HTML profile page via HTTP (fast, when it works).
@@ -2611,12 +2635,14 @@ async def get_profile(username: str) -> ProfileData:
 
       1. in-memory TTL cache (instant, per-process)
       2. persistent SQLite disk cache (instant, survives restarts)
-      3. live providers: Graph API → Apify actor → keyless direct
-         → keyless HTTP ladder (web_profile_info, GraphQL feed, HTML)
+      3. live providers: Graph API → keyless direct HTTP ladder (fast,
+         web_profile_info + GraphQL feed + HTML) → Apify actor (slow but
+         reliable fallback when the direct path is blocked/disabled)
 
     Every failure surfaces honestly (ValueError = handle does not exist,
     RuntimeError = all providers blocked). Simulated data is never served.
     """
+    global _api_block_until  # soft-cooldown write in the Apify-first block below
     username = normalize_username(username)
 
     async with _CACHE_LOCK:
@@ -2725,10 +2751,46 @@ async def get_profile(username: str) -> ProfileData:
             return profile
 
     if bool(APIFY_TOKENS):
-        # Layer 3: live fetch via the Apify pool. On ANY provider-level
-        # failure (tokens exhausted/benched, actor timeout, network error)
-        # fall through to provider #2 — the keyless direct endpoint — before
-        # surfacing an error. Real data keeps flowing when Apify runs dry.
+        # Latency policy: the keyless direct path is the FAST path (7-13s
+        # measured); an Apify 'details' actor run costs 25-35s. Try direct
+        # FIRST and only fall back to Apify when it is unavailable (blocked,
+        # disabled, or errored). The direct ladder's own error classes make
+        # the order safe: a genuine not-found raises ValueError immediately,
+        # and provider-level failures fall through instead of failing hard.
+        # Apify stays as the reliable fallback (and first-choice for stats
+        # -only self-heal refreshes elsewhere in this module).
+        if DIRECT_FETCH_ENABLED and time.monotonic() >= _api_block_until:
+            try:
+                profile = await _fetch_direct_profile(username)
+            except ValueError:
+                raise  # handle genuinely doesn't exist — honest error
+            except (RuntimeError, httpx.HTTPError) as direct_err:
+                print(
+                    f"[fetch] @{username}: direct provider failed "
+                    f"({str(direct_err)[:120]}) — falling back to Apify"
+                )
+            else:
+                # Quality gate: serve the direct result only when it carries
+                # FULL post data. A stats-only result (Instagram served the
+                # page but throttled the post APIs) is real but degrades the
+                # analysis — fall through to Apify for a complete profile.
+                if profile.recent_posts:
+                    await asyncio.to_thread(_disk_profile_set, username, profile)
+                    async with _CACHE_LOCK:
+                        _profile_cache[username] = (time.monotonic(), profile)
+                    return profile
+                print(
+                    f"[fetch] @{username}: direct provider returned stats only "
+                    "— falling back to Apify for full post data"
+                )
+                # Don't pay the ~10s direct attempt again on the next fetch
+                # while Instagram is in this mood: short soft cooldown, then
+                # the direct ladder is retried. Much shorter than the hard
+                # 401/429 block cooldown — this path deliberately does not
+                # trip that one.
+                _api_block_until = time.monotonic() + float(
+                    os.getenv("IG_DIRECT_SOFT_COOLDOWN", "120")
+                )
         try:
             profile = await _fetch_live_profile(username)
         except (RuntimeError, httpx.HTTPError):

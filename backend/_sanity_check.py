@@ -153,8 +153,10 @@ async def test_live_mode_failover_to_direct_provider():
 
 
 async def test_live_mode_pool_exhausted_falls_over_to_direct():
-    """Simulated pool exhaustion: tokens EXIST but every run fails at the
-    token level -> get_profile must fall through to the direct provider."""
+    """Latency policy (direct-first): tokens EXIST but the direct path
+    succeeds -> get_profile must serve from direct and never pay for an
+    Apify actor run. The reverse case (direct failing -> Apify serves) is
+    covered right below."""
     scraper._profile_cache.clear()
     _purge_handle("exhaustedhandle")
 
@@ -165,7 +167,7 @@ async def test_live_mode_pool_exhausted_falls_over_to_direct():
 
         async def fake_apify(username):
             calls["apify"] += 1
-            raise RuntimeError("No Apify token in the pool could serve this request (simulated)")
+            return _make_profile(username, followers=999)
 
         async def fake_direct(username):
             calls["direct"] += 1
@@ -174,15 +176,51 @@ async def test_live_mode_pool_exhausted_falls_over_to_direct():
         real_apify, real_direct = scraper._fetch_live_profile, scraper._fetch_direct_profile
         scraper._fetch_live_profile = fake_apify
         scraper._fetch_direct_profile = fake_direct
+        scraper._api_block_until = 0.0
         got = await scraper.get_profile("exhaustedhandle")
-        assert calls["apify"] == 1 and calls["direct"] == 1, calls
+        assert calls["direct"] == 1 and calls["apify"] == 0, calls
         assert got.followers == 777
-        print("simulated pool exhaustion -> direct fallback: OK")
+        print("direct-first fast path (Apify untouched): OK")
     finally:
         scraper._fetch_live_profile, scraper._fetch_direct_profile = real_apify, real_direct
         scraper.APIFY_TOKENS = old
         scraper._profile_cache.clear()
         _purge_handle("exhaustedhandle")
+
+
+async def test_direct_failure_falls_over_to_apify():
+    """Direct-first policy, failure side: the keyless direct provider failing
+    (blocked/errored) must fall through to the Apify pool — never dead-end."""
+    scraper._profile_cache.clear()
+    _purge_handle("directdownhandle")
+
+    old = list(scraper.APIFY_TOKENS)
+    scraper.APIFY_TOKENS = ["fake-ok-token"]
+    try:
+        calls = {"apify": 0, "direct": 0}
+
+        async def fake_apify(username):
+            calls["apify"] += 1
+            return _make_profile(username, followers=999)
+
+        async def fake_direct(username):
+            calls["direct"] += 1
+            raise RuntimeError("Instagram rate-limiting this IP (simulated)")
+
+        real_apify, real_direct = scraper._fetch_live_profile, scraper._fetch_direct_profile
+        scraper._fetch_live_profile = fake_apify
+        scraper._fetch_direct_profile = fake_direct
+        scraper._api_block_until = 0.0
+        got = await scraper.get_profile("directdownhandle")
+        assert calls["direct"] == 1 and calls["apify"] == 1, calls
+        assert got.followers == 999
+        print("direct failure -> Apify fallback: OK")
+    finally:
+        scraper._fetch_live_profile, scraper._fetch_direct_profile = real_apify, real_direct
+        scraper.APIFY_TOKENS = old
+        scraper._profile_cache.clear()
+        _purge_handle("directdownhandle")
+        scraper._api_block_until = 0.0
 
 
 async def test_live_mode_honest_error_when_all_providers_fail():
@@ -251,7 +289,7 @@ def _cleanup_test_rows():
     conn = sqlite3.connect(scraper._CACHE_DB)
     for prefix in ("cacheuser", "cacheduser", "batchknown", "batchunknown",
                    "disco_main", "disco_rival1", "disco_rival2",
-                   "directonlyhandle", "exhaustedhandle", "bothfailhandle"):
+                   "directonlyhandle", "exhaustedhandle", "directdownhandle", "bothfailhandle"):
         conn.execute("DELETE FROM cache WHERE key LIKE ?", (f"profile:{prefix}%",))
         conn.execute("DELETE FROM cache WHERE key LIKE ?", (f"related:{prefix}%",))
     conn.commit()
@@ -265,6 +303,7 @@ if __name__ == "__main__":
     asyncio.run(test_batch_mixed())
     asyncio.run(test_live_mode_failover_to_direct_provider())
     asyncio.run(test_live_mode_pool_exhausted_falls_over_to_direct())
+    asyncio.run(test_direct_failure_falls_over_to_apify())
     asyncio.run(test_live_mode_honest_error_when_all_providers_fail())
     test_local_discovery()
     test_no_demo_machinery()
