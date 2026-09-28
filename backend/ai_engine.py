@@ -149,12 +149,17 @@ def _llm_candidate_specs() -> List[dict]:
             "model": m,
         })
         seen.add(m)
-    if LLM_FALLBACK_API_KEY and LLM_FALLBACK_MODEL and LLM_FALLBACK_MODEL not in _LLM_DEAD_MODELS:
+    # Fallback provider: LLM_FALLBACK_MODEL may be a comma-separated list —
+    # each id gets its own attempt (in order) before the chain gives up to
+    # the rule-based fallbacks. Lets e.g. a NIM key cover two model ids.
+    for fm in [t.strip() for t in LLM_FALLBACK_MODEL.split(",") if t.strip()]:
+        if fm in _LLM_DEAD_MODELS:
+            continue
         specs.append({
-            "label": f"{LLM_FALLBACK_MODEL} [fallback]",
+            "label": f"{fm} [fallback]",
             "base_url": LLM_FALLBACK_BASE_URL or None,
             "api_key": LLM_FALLBACK_API_KEY,
-            "model": LLM_FALLBACK_MODEL,
+            "model": fm,
         })
     return specs
 
