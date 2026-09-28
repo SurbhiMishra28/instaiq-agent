@@ -163,23 +163,37 @@ def _llm_candidate_specs() -> List[dict]:
 # Structured outputs (LangChain with_structured_output)
 # ---------------------------------------------------------------------------
 
+class MetricVerdict(BaseModel):
+    """One metric + its plain-language verdict, for the Simple view."""
+    metric: str = Field(description="Metric name, e.g. 'Engagement rate'")
+    value: str = Field(description="The real value, e.g. '3.2%'")
+    verdict: str = Field(description="Exactly one of: Good | Okay | Needs work")
+    plain: str = Field(description="One plain sentence: what the number means + is it good. Example: '3.2% means about 3 out of every 100 followers liked or commented. That is good for your niche.'")
+
+
 class ProfileNarrative(BaseModel):
-    """LLM output for the per-profile insight chain."""
-    summary: str = Field(description="2-4 sentence analyst summary of the account")
+    """LLM output for the per-profile insight chain.
+
+    Beginner-first shape: every line follows What we found -> Why it
+    matters -> What to do next, written at a 7th-grade reading level, and
+    every metric carries a Good/Okay/Needs work verdict."""
+    summary: str = Field(description="3-5 short sentences. First sentence = the one-line verdict of the account. Every sentence: short, plain words, no jargon.")
     # max_length is deliberately absent: strict list caps made the free-tier
     # LLM's occasional 5-item list a hard validation error, which failed the
     # whole insight chain. Over-long lists are trimmed downstream instead.
-    strengths: List[str] = Field(description="Up to 3 specific strengths")
-    weaknesses: List[str] = Field(description="Up to 3 specific weaknesses")
-    recommendations: List[str] = Field(description="Up to 4 concrete, specific recommendations")
+    strengths: List[str] = Field(description="Up to 3 strengths. EACH one: 'What we found (with the real number) -> why it matters for this account -> what to do next.' Short sentences, plain words.")
+    weaknesses: List[str] = Field(description="Up to 3 weaknesses, same shape as strengths: found -> why it matters -> what to do.")
+    recommendations: List[str] = Field(description="Up to 4 actions doable THIS WEEK. Each names an exact count, length or day. Bad: 'Post more reels.' Good: 'Post 3 reels this week, 15-30 seconds each, showing a behind-the-scenes moment.'")
+    metric_verdicts: List[MetricVerdict] = Field(default_factory=list, description="One per key metric")
+    top_actions: List[str] = Field(default_factory=list, description="Exactly 3 checklist items for this week")
 
 
 class MarketResearch(BaseModel):
     """LLM output for the competitive-set research chain."""
-    market_summary: str = Field(description="3-5 sentence summary of the competitive landscape")
-    competitive_gaps: List[str] = Field(max_length=5, description="Where the main account trails specific rivals")
-    content_gaps: List[str] = Field(max_length=5, description="Content/format/topic spaces rivals own that the main account could take")
-    opportunities: List[str] = Field(max_length=5, description="Concrete, specific opportunities for the main account")
+    market_summary: str = Field(description="3-5 short sentences, 7th-grade reading level. Name the numbers when comparing.")
+    competitive_gaps: List[str] = Field(max_length=5, description="Each: 'Rival X does Y (number) -> why that matters for you -> one thing to do.'")
+    content_gaps: List[str] = Field(max_length=5, description="Each: 'Rivals post Z but you don't -> the opportunity -> one post idea to try this week.'")
+    opportunities: List[str] = Field(max_length=5, description="Concrete, doable this week, with an exact count or timeframe.")
 
 
 class CompetitorShortlist(BaseModel):
@@ -601,27 +615,91 @@ Top hashtags: {', '.join(m.top_hashtags) if m.top_hashtags else '(none)'}"""
 # ---------------------------------------------------------------------------
 
 _INSIGHT_SYSTEM = (
-    "You are a senior Instagram growth analyst. You ground every claim in the "
-    "provided metrics — never invent numbers. Recommendations must be concrete "
-    "and reference the account's actual data."
+    "You are a friendly Instagram coach for small-business owners who have "
+    "never seen a marketing dashboard before. Rules: "
+    "(1) 7th-grade reading level — short sentences, plain words, no jargon "
+    "(explain any term you must use in the same sentence). "
+    "(2) Ground every claim in the provided metrics — never invent numbers. "
+    "(3) Every point follows: What we found -> Why it matters -> What to do "
+    "next. "
+    "(4) When a metric appears, explain it in one plain line, e.g. "
+    "'Engagement rate 3.2% means about 3 out of every 100 followers liked or "
+    "commented. That is good for your niche.' "
+    "(5) Recommendations are doable THIS WEEK with exact counts, lengths or "
+    "days. Bad: 'Post more reels.' Good: 'Post 3 reels this week, 15-30 "
+    "seconds each, showing a behind-the-scenes moment.'"
 )
 
 _INSIGHT_HUMAN = """Analyze this Instagram account's performance:
 
 {facts}
 
-Write the analyst readout. Strengths/weaknesses must cite actual numbers from
-the data. Recommendations must be actions this specific account can take."""
+Write the coach readout:
+- summary: 3-5 short sentences. First sentence = the verdict of this account in plain words.
+- strengths / weaknesses: each item follows 'What we found (real number) -> why it matters -> what to do next.'
+- recommendations: actions doable this week, with exact counts/lengths/days.
+- metric_verdicts: one entry for engagement rate, posting frequency, avg comments and follower ratio. Each has verdict Good/Okay/Needs work and one plain sentence explaining the number.
+- top_actions: EXACTLY 3 checklist items for this week, each specific and doable.
+"""
+
+def _metric_verdict(metric: str, value: str, good: bool, mid: bool, plain: str) -> MetricVerdict:
+    return MetricVerdict(
+        metric=metric, value=value,
+        verdict="Good" if good else ("Okay" if mid else "Needs work"),
+        plain=plain,
+    )
+
+
+def _plain_metric_explainers(profile: ProfileData, m: ProfileMetrics) -> List[MetricVerdict]:
+    """Rule-based metric verdicts: the same plain-language shape the LLM is
+    asked for, so the Simple view works with zero AI providers."""
+    er = m.engagement_rate
+    out = [
+        _metric_verdict(
+            "Engagement rate", f"{er}%", er >= 3, 1 <= er < 3,
+            f"{er}% means about {max(1, round(er))} out of every 100 followers "
+            f"liked or commented. "
+            + ("That is good for your niche." if er >= 3
+               else ("That is okay, but there is room to grow." if er >= 1
+                     else "That needs work — your posts need a stronger hook or a clearer call to action.")),
+        ),
+        _metric_verdict(
+            "Posts per week", f"{m.posting_frequency_per_week:g}",
+            m.posting_frequency_per_week >= 3, 1 <= m.posting_frequency_per_week < 3,
+            f"You posted about {m.posting_frequency_per_week:g} times a week in this sample. "
+            + ("That is enough to keep the algorithm showing your posts." if m.posting_frequency_per_week >= 3
+               else ("A bit more would help — aim for 3." if m.posting_frequency_per_week >= 1
+                     else "Posting rarely makes it hard for new people to find you.")),
+        ),
+        _metric_verdict(
+            "Avg comments", f"{m.avg_comments:.1f}",
+            m.avg_comments >= 10, 2 <= m.avg_comments < 10,
+            f"Each post gets about {m.avg_comments:.0f} comments. "
+            + ("Great — people feel invited to reply." if m.avg_comments >= 10
+               else ("Decent — try ending captions with a question to lift it." if m.avg_comments >= 2
+                     else "This account is not getting comments yet. Try asking a question in your captions.")),
+        ),
+        _metric_verdict(
+            "Follower ratio", f"{m.follower_following_ratio:.1f}:1",
+            m.follower_following_ratio >= 2, 0.8 <= m.follower_following_ratio < 2,
+            f"You follow 1 account for every {m.follower_following_ratio:.1f} followers you have. "
+            + ("That reads as an established account." if m.follower_following_ratio >= 2
+               else ("Balanced enough — focus on posting, not following numbers." if m.follower_following_ratio >= 0.8
+                     else "You follow more than you are followed — trim follows and invite followers with your content.")),
+        ),
+    ]
+    return out
+
 
 # Fallback kept from the original rule-based engine.
 def _rule_based_summary(profile: ProfileData, m: ProfileMetrics) -> ProfileNarrative:
     quality = _rate_engagement(m.engagement_rate)
     summary = (
         f"@{profile.username} is a {profile.category or 'general'} account with "
-        f"{profile.followers:,} followers and {quality} engagement at {m.engagement_rate}%. "
-        f"They post roughly {m.posting_frequency_per_week}x/week, and "
-        f"{m.best_content_type} content performs best for this account. "
-        f"Average post pulls {int(m.avg_likes):,} likes and {int(m.avg_comments):,} comments."
+        f"{profile.followers:,} followers. Engagement is {m.engagement_rate}% — "
+        f"that means about {max(1, round(m.engagement_rate))} out of every 100 followers "
+        f"liked or commented. They post about {m.posting_frequency_per_week:g}x a week, "
+        f"and {m.best_content_type} posts do best."
     )
 
     strengths, weaknesses, recs = [], [], []
@@ -671,7 +749,9 @@ def _rule_based_summary(profile: ProfileData, m: ProfileMetrics) -> ProfileNarra
         weaknesses.append("No major weaknesses detected in the sampled data — focus shifts to scaling what already works.")
 
     return ProfileNarrative(
-        summary=summary, strengths=strengths, weaknesses=weaknesses, recommendations=recs
+        summary=summary, strengths=strengths, weaknesses=weaknesses, recommendations=recs,
+        metric_verdicts=_plain_metric_explainers(profile, m),
+        top_actions=[r for r in recs if r][:3],
     )
 
 
@@ -713,6 +793,8 @@ def analyze_profile(profile: ProfileData, use_llm: bool = True) -> ProfileInsigh
             weaknesses=narrative.weaknesses,
             recommendations=narrative.recommendations,
             account_score=account_score_from(profile, metrics),
+            metric_verdicts=[v.model_dump() for v in narrative.metric_verdicts],
+            top_actions=narrative.top_actions[:3],
         )
 
     key = _insight_memo_key(profile)
@@ -742,6 +824,14 @@ def analyze_profile(profile: ProfileData, use_llm: bool = True) -> ProfileInsigh
             print(f"[ai] insight chain: rule-based fallback ({str(e)[:110]})", flush=True)
             # keep the rule-based narrative on any LLM failure
 
+    # LLM verdicts may be missing/garbage on free tiers — always guarantee
+    # the full set so the Simple view never renders empty.
+    verdicts = list(narrative.metric_verdicts or [])
+    if not verdicts:
+        verdicts = _plain_metric_explainers(profile, metrics)
+    top = [t for t in (narrative.top_actions or []) if t][:3]
+    if not top:
+        top = narrative.recommendations[:3]
     insight = ProfileInsight(
         profile=profile,
         metrics=metrics,
@@ -752,6 +842,8 @@ def analyze_profile(profile: ProfileData, use_llm: bool = True) -> ProfileInsigh
         weaknesses=narrative.weaknesses[:3],
         recommendations=narrative.recommendations[:4],
         account_score=account_score_from(profile, metrics),
+        metric_verdicts=[v.model_dump() if isinstance(v, MetricVerdict) else v for v in verdicts],
+        top_actions=top,
     )
     _INSIGHT_MEMO[key] = insight
     if len(_INSIGHT_MEMO) > 200:  # bounded
@@ -965,6 +1057,188 @@ def pick_competitors(main_profile: ProfileData, candidates: List[dict], count: i
 
     fallback = _rule_based_pick(main_profile, candidates, count)
     return fallback.picked, fallback.rationale
+
+
+# ---------------------------------------------------------------------------
+# Profession + location understanding (competitor discovery, step 1)
+# ---------------------------------------------------------------------------
+
+class ProfessionProfile(BaseModel):
+    """Strict-JSON output of the profile-understanding chain: what this
+    account IS (profession/specialty) and WHERE it operates (city/state).
+    Fields the source text does not support stay None — never guessed."""
+    profession: Optional[str] = Field(None, description="e.g. doctor, dentist, fitness coach, cafe")
+    specialty: Optional[str] = Field(None, description="e.g. dermatologist, orthopedic surgeon")
+    city: Optional[str] = Field(None, description="City the account operates in, e.g. Noida")
+    state: Optional[str] = Field(None, description="State/region, e.g. Uttar Pradesh")
+    audience_type: Optional[str] = Field(None, description="e.g. local patients, gym-goers, homeowners")
+    search_keywords: List[str] = Field(
+        default_factory=list, max_length=8,
+        description="2-4 web-search queries to find similar accounts, e.g. 'dermatologist noida'",
+    )
+
+
+_PROFESSION_SYSTEM = (
+    "You extract structured facts from an Instagram account's own text "
+    "(bio, name, category, captions). Return ONLY what the text supports — "
+    "use null for anything not stated. Never guess a profession or city. "
+    "search_keywords must combine profession + city for finding similar "
+    "local businesses on the web."
+)
+
+_PROFESSION_HUMAN = """Account text:
+
+handle: @{username}
+name: {full_name}
+category: {category}
+bio:
+{bio}
+
+captions (recent posts):
+{captions}
+
+hashtags: {hashtags}
+
+Extract: profession, specialty, city, state, audience_type, and 3-6
+search_keywords (each combining the profession/specialty with the city when
+a city is known). Use null for fields the text does not support."""
+
+
+def understand_profile_location(
+    profile: ProfileData,
+) -> Tuple[Dict[str, Any], str]:
+    """Step 1 of profession+location discovery: what is this account and
+    where is it?
+
+    LLM path: strict-JSON chain over bio/name/category/captions.
+    Fallback (no LLM key, breaker open, or any failure): keyword matching on
+    the bio/full name/category — profession from a known-professions lexicon,
+    city from a known-cities lexicon (Indian metros + globals). NEVER raises.
+
+    Returns ({profession, specialty, city, state, audience_type,
+    search_keywords}, source) where source is 'llm' | 'keywords'."""
+    prof = {
+        "profession": None, "specialty": None, "city": None,
+        "state": None, "audience_type": None, "search_keywords": [],
+    }
+
+    if _llm_available():
+        try:
+            from langchain_core.prompts import ChatPromptTemplate
+            captions = "\n".join(
+                f"- {(p.caption or '')[:110]}"
+                for p in (profile.recent_posts or [])[:8] if p.caption
+            ) or "(none)"
+            tags = ", ".join(
+                t for p in (profile.recent_posts or [])[:8] for t in (p.hashtags or [])
+            )[:200] or "(none)"
+            prompt = ChatPromptTemplate.from_messages(
+                [("system", _PROFESSION_SYSTEM), ("human", _PROFESSION_HUMAN)]
+            )
+
+            def _run(client):
+                chain = prompt | _structured(client, ProfessionProfile)
+                return chain.invoke({
+                    "username": profile.username,
+                    "full_name": profile.full_name or "(none)",
+                    "category": profile.category or "(none)",
+                    "bio": (profile.bio or "(none)")[:500],
+                    "captions": captions,
+                    "hashtags": tags,
+                })
+
+            out: ProfessionProfile = _invoke_llm_sync(_run, temperature=0.0)
+            data = out.model_dump()
+            kws = [
+                str(k).strip().lower() for k in (data.get("search_keywords") or [])
+                if str(k).strip()
+            ][:6]
+            data["search_keywords"] = kws
+            # Sanity: nothing usable -> fall through to keywords.
+            if data.get("profession") or data.get("city") or kws:
+                return data, "llm"
+        except Exception as e:
+            print(f"[ai] profession understanding failed ({str(e)[:110]}) "
+                  "— bio keyword fallback", flush=True)
+
+    # --- Fallback: keyword matching on the account's own text --------------
+    text = " ".join([
+        profile.bio or "", profile.full_name or "", profile.category or "",
+        " ".join((p.caption or "") for p in (profile.recent_posts or [])[:8]),
+    ]).lower()
+
+    profession = None
+    specialty = None
+    for kw, label in _PROFESSION_LEXICON:
+        if kw in text:
+            if specialty is None and label != profession and profession is not None:
+                specialty = label
+            elif profession is None:
+                profession = label
+    if profession is None:
+        for kw, label in _PROFESSION_LEXICON:
+            if kw in text:
+                profession = label
+                break
+
+    city = state = None
+    for c, st in _CITY_LEXICON:
+        if c in text:
+            city = c.title()
+            state = st
+            break
+
+    audience = "local customers" if city else None
+    kws: List[str] = []
+    if profession and city:
+        kws.append(f"{profession} {city}")
+        if specialty:
+            kws.append(f"{specialty} {city}")
+        kws.append(f"{profession} instagram {city}")
+    elif profession:
+        kws.append(f"{profession} instagram")
+    elif city:
+        kws.append(f"instagram {city} business")
+    return {
+        "profession": profession, "specialty": specialty,
+        "city": city, "state": state, "audience_type": audience,
+        "search_keywords": kws[:6],
+    }, "keywords"
+
+
+# (keyword, label) pairs — checked in order; specialty-specific keywords
+# first so 'dermatologist' beats the generic 'doctor' match.
+_PROFESSION_LEXICON: List[Tuple[str, str]] = [
+    ("dermatologist", "dermatologist"), ("skin specialist", "dermatologist"),
+    ("dentist", "dentist"), ("orthodontist", "dentist"), ("orthopedic", "orthopedic surgeon"),
+    ("gynecolog", "gynecologist"), ("pediatric", "pediatrician"), ("cardiolog", "cardiologist"),
+    ("physiother", "physiotherapist"), ("eye specialist", "ophthalmologist"),
+    ("ophthalmolog", "ophthalmologist"), ("doctor", "doctor"), ("clinic", "clinic"),
+    ("hair transplant", "hair transplant clinic"), ("salon", "salon"), ("spa", "spa"),
+    ("gym", "gym"), ("fitness coach", "fitness coach"), ("personal trainer", "fitness coach"),
+    ("cafe", "cafe"), ("coffee", "cafe"), ("bakery", "bakery"), ("restaurant", "restaurant"),
+    ("real estate", "real estate agent"), ("realtor", "real estate agent"),
+    ("interior", "interior designer"), ("photographer", "photographer"),
+    ("advocate", "lawyer"), ("lawyer", "lawyer"), ("law firm", "lawyer"),
+    ("chartered accountant", "accountant"), ("ca firm", "accountant"),
+    ("boutique", "boutique"), ("tailor", "boutique"), ("tuition", "tutor"),
+    ("coaching", "coach"), ("academy", "coach"),
+]
+
+# (city_keyword, state) — matched lowercase in the account text.
+_CITY_LEXICON: List[Tuple[str, str]] = [
+    ("noida", "Uttar Pradesh"), ("greater noida", "Uttar Pradesh"),
+    ("ghaziabad", "Uttar Pradesh"), ("lucknow", "Uttar Pradesh"),
+    ("gurugram", "Haryana"), ("gurgaon", "Haryana"), ("faridabad", "Haryana"),
+    ("delhi", "Delhi"), ("new delhi", "Delhi"), ("mumbai", "Maharashtra"),
+    ("pune", "Maharashtra"), ("nagpur", "Maharashtra"), ("bengaluru", "Karnataka"),
+    ("bangalore", "Karnataka"), ("hyderabad", "Telangana"), ("chennai", "Tamil Nadu"),
+    ("kolkata", "West Bengal"), ("ahmedabad", "Gujarat"), ("surat", "Gujarat"),
+    ("jaipur", "Rajasthan"), ("indore", "Madhya Pradesh"), ("bhopal", "Madhya Pradesh"),
+    ("chandigarh", "Punjab"), ("kochi", "Kerala"), ("goa", "Goa"),
+    ("london", "UK"), ("dubai", "UAE"), ("singapore", "Singapore"),
+    ("new york", "New York"), ("toronto", "Ontario"),
+]
 
 
 # ---------------------------------------------------------------------------

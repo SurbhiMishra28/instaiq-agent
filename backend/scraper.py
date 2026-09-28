@@ -35,6 +35,7 @@ Instagram users as fallback.
 import asyncio
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -1735,6 +1736,36 @@ def _parse_chrome_payload(data: Dict[str, Any], username: str) -> Optional[Profi
 
 
 
+async def _fetch_graphql_profile(username: str) -> Optional[ProfileData]:
+    """Keyless real-data refresh via Instagram's own GraphQL layer.
+
+    Ladder (zero tokens, zero actor runs):
+      1. harvested Playwright session -> POST /api/graphql with doc_id (or
+         GET web_profile_info with the harvested cookies) — the pure-API
+         path built for Apify-exhaustion;
+      2. classic bootstrapped session -> GET web_profile_info.
+    Returns None (never raises) when Instagram refuses — callers treat this
+    as best-effort enrichment over the stored snapshot."""
+    try:
+        uname = normalize_username(username)
+    except ValueError:
+        return None
+
+    # 1) harvested-session pure-API rung (Playwright session, no render)
+    if PW_FETCH_ENABLED and _pw_ensure_session():
+        pw = await asyncio.to_thread(_fetch_pw_api_profile, uname)
+        if pw is not None:
+            return pw
+
+    # 2) classic bootstrapped web_profile_info (existing keyless ladder)
+    if DIRECT_FETCH_ENABLED:
+        try:
+            return await _fetch_direct_profile(uname)
+        except (ValueError, RuntimeError, httpx.HTTPError):
+            return None
+    return None
+
+
 async def _fetch_chrome_profile(username: str) -> Optional[ProfileData]:
     """Provider #2b: render instagram.com/<handle>/ in real local Chrome
     (keyless) and parse the real page. Only runs where Chrome + Node +
@@ -1788,6 +1819,628 @@ async def _fetch_chrome_profile(username: str) -> Optional[ProfileData]:
             f"@{username} via local Chrome render (keyless, {len(profile.recent_posts)} posts)",
         )
     return profile
+
+
+# ---------------------------------------------------------------------------
+# Provider #2c - Playwright session harvest + pure-API Instagram fetch
+#
+# When the Apify pool is exhausted (or none configured) and the plain-HTTP
+# direct ladder is throttled, this rung spends ONE real headless-browser
+# page load to harvest Instagram's own API session parameters, then scrapes
+# everything afterwards at the pure API level — no full HTML renders.
+#
+# Harvest (once per TTL, persisted to disk across restarts):
+#   1. Open https://www.instagram.com/instagram/ in Playwright with a
+#      RANDOMIZED user-agent (window + locale randomized too).
+#   2. page.on("response") intercepts every outbound request the page's
+#      own frontend makes and extracts:
+#        - doc_id   → the persisted-query hash Instagram's web app sends to
+#                     POST /api/graphql (the body carries "doc_id":"<digits>").
+#                     The doc_id request whose body names a username is
+#                     preferred — that is the profile-by-username query.
+#        - lsd      → the x-fb-lsd token (response headers first, then the
+#                     bootstrapped page source).
+#        - csrftoken→ the session cookie the page bootstrap sets.
+#   3. The triple is kept in memory (TTL) AND on disk (backend/ig_session.json,
+#     0600-equivalent best effort, .gitignored) so restarts reuse it.
+#
+# Pure-API fetch (cheap, every profile):
+#   POST https://www.instagram.com/api/graphql with the harvested doc_id,
+#   variables {"username": ...}, lsd/csrftoken headers and the SAME cookies
+#   a real page session holds (captured via context.cookies() at harvest).
+#   Response is the same user JSON _map_direct_user already parses (both the
+#   legacy edge_* shape and the modern xdt_api__v1__feed shape).
+#   Fallback inside the rung: GET web_profile_info with the harvested
+#   session when the POST is refused.
+#
+# This is the cheap alternative to rendering every profile in a browser:
+# one browser load per IG_SESSION_TTL (default 12h) instead of per profile.
+# ---------------------------------------------------------------------------
+
+PW_FETCH_ENABLED = os.getenv("IG_PW_FETCH", "true").lower() in ("1", "true", "yes")
+# Rung-first diagnostic mode (default off): try the Playwright pure-API rung
+# BEFORE Graph/Apify/plain-HTTP in get_profile, so a live analyze can be
+# proven to flow through the rung. Normal operation leaves this unset.
+_PW_PREFERRED = os.getenv("IG_PW_PREFERRED", "false").lower() in ("1", "true", "yes")
+# Harvested-session cache TTL. The spec window is 6-12h: default 12h, raise
+# IG_SESSION_TTL=21600 for a 6h rotation. Applies to BOTH the in-memory
+# session and the ig_session.json disk copy (they share one clock).
+_PW_SESSION_TTL = float(os.getenv("IG_SESSION_TTL", "43200"))  # 12h harvest TTL
+_PW_HARVEST_TIMEOUT = float(os.getenv("IG_PW_HARVEST_TIMEOUT", "45"))  # seconds
+_PW_HARVEST_SEED = os.getenv("IG_PW_HARVEST_SEED", "instagram")
+_PW_HARVEST_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ig_session.json"
+)
+# Consumed browsers per harvest session before a fresh one is required.
+_PW_SESSION_USES = int(os.getenv("IG_PW_SESSION_USES", "400"))
+# Minimum spacing between harvest attempts (seconds): a refused session
+# triggers ONE re-extraction per fetch, and repeated failures never spin the
+# browser on every incoming request. Keep >= 2x the harvest timeout.
+_PW_REHARVEST_MIN_SECS = max(90.0, 2.5 * _PW_HARVEST_TIMEOUT)
+# Request headers NOT replayed from the captured template: cookies come from
+# the harvested jar, and host/content-length/connection are per-connection.
+_PW_SKIP_HEADERS = {"cookie", "host", "content-length", "connection"}
+# Optional explicit profile-query doc_id (persisted-query hash). The
+# logged-out web frontend server-renders profiles, so its outbound GraphQL
+# traffic usually does NOT carry the arbitrary-handle profile query; set
+# IG_GQL_DOC_ID to a captured doc_id to enable the POST /api/graphql rung.
+# When unset (default), the rung uses the harvested session on the proven
+# web_profile_info endpoint instead.
+_PW_GQL_DOC_ID_OVERRIDE = (os.getenv("IG_GQL_DOC_ID") or "").strip()
+
+# Realistic UA pool (Chrome 126-133, Win/mac/Linux). The interceptor captures
+# requests from a browser whose user-agent matches a real desktop build, and
+# the pure-API fetch later sends the SAME ua so headers stay consistent.
+_PW_UA_POOL = (
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36", "Windows"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "Windows"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36", "Mac OS X"),
+    ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36", "Linux"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36", "Mac OS X"),
+)
+
+# Reentrant: _pw_ensure_session -> _harvest_ig_session -> _store_pw_session
+# all run on the same thread and each takes the lock; a plain Lock would
+# self-deadlock the harvest.
+_pw_lock = threading.RLock()
+_pw_session: Dict[str, Any] = {"cookies": None, "lsd": "", "doc_id": "", "ts": 0.0, "ua": "", "template": None}
+# Monotonic timestamp of the last COMPLETED harvest (successful or not) —
+# spaces out re-extraction attempts so a broken environment never spins the
+# browser in a loop.
+_pw_last_harvest = 0.0
+
+
+def _pw_random_ua() -> Tuple[str, str]:
+    """(user_agent, platform) picked at random from a realistic pool."""
+    return random.choice(_PW_UA_POOL)
+
+
+def _pw_session_fresh() -> bool:
+    """True when the in-memory harvest is inside its TTL and still has uses.
+    A session Instagram has REFUSED (400/403/status-fail) is deliberately
+    NOT fresh: _pw_mark_session_stale stamps ts=-inf so this returns False
+    and the next fetch re-harvests, while the disk copy is skipped too."""
+    st = _pw_session
+    return (
+        bool(st["cookies"]) and (time.time() - st["ts"]) < _PW_SESSION_TTL
+        and st.get("uses", 0) < _PW_SESSION_USES
+    )
+
+
+def _pw_mark_session_stale() -> None:
+    """Flag the harvested session as refused by Instagram so the next fetch
+    re-extracts fresh tokens. Both copies are invalidated: the in-memory
+    ts is stamped to -inf (fresh()/active() checks reject it) and the disk
+    copy is deleted so a restart cannot resurrect the refused session."""
+    with _pw_lock:
+        _pw_session["ts"] = float("-inf")
+        try:
+            os.remove(_PW_HARVEST_FILE)
+        except OSError:
+            pass
+
+
+def _load_pw_session() -> None:
+    """Populate the in-memory session from ig_session.json when the memory
+    copy is missing/stale. Never raises; a corrupt file is ignored."""
+    try:
+        if _pw_session_fresh():
+            return
+        with open(_PW_HARVEST_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if (
+            isinstance(d, dict) and isinstance(d.get("cookies"), list) and d["cookies"]
+            and (time.time() - float(d.get("ts") or 0)) < _PW_SESSION_TTL
+        ):
+            _pw_session.update({
+                "cookies": d["cookies"],
+                "lsd": str(d.get("lsd") or ""),
+                "doc_id": str(d.get("doc_id") or ""),
+                "ua": str(d.get("ua") or ""),
+                "ts": float(d.get("ts") or 0.0),
+                "uses": 0,
+                "template": d.get("template") if isinstance(d.get("template"), dict) else None,
+            })
+    except Exception:
+        pass
+
+
+def _save_pw_session() -> None:
+    """Persist the harvested session (cookies + tokens + request template) to
+    ig_session.json (best effort). The file holds no credentials beyond
+    anonymous web-session cookies."""
+    try:
+        d = {
+            "cookies": _pw_session["cookies"],
+            "lsd": _pw_session["lsd"],
+            "doc_id": _pw_session["doc_id"],
+            "ua": _pw_session["ua"],
+            "ts": _pw_session["ts"],
+            "template": _pw_session.get("template"),
+        }
+        with open(_PW_HARVEST_FILE, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+        try:
+            os.chmod(_PW_HARVEST_FILE, 0o600)
+        except Exception:
+            pass  # best effort (Windows/POSIX differences)
+    except Exception:
+        pass
+
+
+def _store_pw_session(cookies: list, lsd: str, doc_id: str, ua: str,
+                      template: Optional[Dict[str, Any]] = None) -> None:
+    with _pw_lock:
+        _pw_session.update({
+            "cookies": cookies, "lsd": lsd, "doc_id": doc_id,
+            "ua": ua, "ts": time.time(), "uses": 0,
+            "template": template,
+        })
+    _save_pw_session()
+
+
+def _pw_session_active() -> bool:
+    """Session usable for a pure-API call (cookies + at least lsd/doc_id).
+    Instagram-refused (stale) sessions are NOT active."""
+    with _pw_lock:
+        return (
+            bool(_pw_session["cookies"])
+            and (bool(_pw_session["doc_id"]) or bool(_pw_session["lsd"]))
+            and (_pw_session["ts"] != float("-inf"))
+        )
+
+
+def _extract_doc_id(post_data: str) -> str:
+    """doc_id (persisted-query hash) from a GraphQL request body. Real
+    /api/graphql POSTs arrive as form-urlencoded bodies (doc_id=23996118...)
+    while fetch()-style calls send JSON ("doc_id":"..."). Handles both plus
+    the escaped nested-body variant. Requires >=10 digits (real persisted
+    -query hashes are 16-19 digits) so 'doc_id=12345' never matches."""
+    body = post_data or ""
+    m = re.search(r'"doc_id"\s*:\s*"(\d{10,})"', body)
+    if m:
+        return m.group(1)
+    m = re.search(r'(?:^|&)doc_id=(\d{10,})(?:&|$)', body)
+    if m:
+        return m.group(1)
+    m = re.search(r'doc_id\\+":\\+"(\d{10,})', body)
+    return m.group(1) if m else ""
+
+
+def _harvest_ig_session() -> bool:
+    """One real browser load of a public profile page, harvesting the API
+    session from the page's OWN outbound requests (doc_id / lsd / csrftoken).
+
+    Sync (Playwright is sync here) — call via asyncio.to_thread. Returns True
+    when a usable session (cookies + doc_id or lsd) was stored. Never raises.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        print(f"[pw-harvest] playwright not installed ({type(e).__name__}) "
+              "— run: pip install -r requirements-playwright.txt && playwright install chromium")
+        return False
+
+    ua, platform = _pw_random_ua()
+    print(f"[pw-harvest] launching randomized-UA session ({platform}) …", flush=True)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=(
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ),
+            )
+            try:
+                context = browser.new_context(
+                    user_agent=ua,
+                    viewport={
+                        "width": random.randint(1200, 1440),
+                        "height": random.randint(800, 960),
+                    },
+                    locale=random.choice(["en-US", "en-GB", "en-CA"]),
+                    timezone_id="America/New_York",
+                )
+                page = context.new_page()
+            except Exception:
+                browser.close()
+                raise
+
+            found = {"doc_id": "", "doc_id_any": "", "lsd": "", "post_seen": False,
+                     "template": None}
+
+            def _on_response(resp):
+                """Intercept EVERY outbound request the page makes and pull
+                the session parameters from real traffic."""
+                try:
+                    req = resp.request
+                    url = req.url
+                    # --- lsd: the token rides response headers on page parts
+                    hdr = (resp.headers or {}).get("x-fb-lsd") or ""
+                    if hdr and not found["lsd"]:
+                        found["lsd"] = hdr
+                    # --- doc_id: POST /api/graphql (or /graphql/query) bodies
+                    if (
+                        ("/api/graphql" in url or "/graphql/query" in url)
+                        and req.method == "POST"
+                    ):
+                        body = (req.post_data or "")
+                        did = _extract_doc_id(body)
+                        if did:
+                            # The profile-by-username query names the handle in
+                            # its body — that doc_id is exactly the one the
+                            # pure-API fetch needs for ARBITRARY handles.
+                            # Bodies are form-urlencoded: the marker appears
+                            # both raw ("username") and encoded (%22username%22).
+                            names_username = (
+                                '"username"' in body or "%22username%22" in body
+                            )
+                            if names_username:
+                                found["doc_id"] = did
+                                found["post_seen"] = True
+                                # Capture the FULL request once: the exact
+                                # header set and body shape the page's own
+                                # frontend sends. The pure-API fetch replays
+                                # this template byte-for-byte (only the
+                                # username swapped), which is what makes the
+                                # off-browser replay pass Instagram's checks.
+                                if found["template"] is None:
+                                    found["template"] = {
+                                        "headers": dict(req.headers),
+                                        "body": body,
+                                    }
+                            elif not found["doc_id_any"]:
+                                found["doc_id_any"] = did
+                except Exception:
+                    pass  # interception must never break the harvest
+
+            page.on("response", _on_response)
+            try:
+                page.goto(
+                    f"https://www.instagram.com/{_PW_HARVEST_SEED}/",
+                    wait_until="domcontentloaded",
+                    timeout=int(_PW_HARVEST_TIMEOUT * 1000),
+                )
+                # Give the page's own frontend time to fire its GraphQL calls.
+                deadline = time.time() + _PW_HARVEST_TIMEOUT
+                while time.time() < deadline:
+                    if found["doc_id"] and found["post_seen"]:
+                        break
+                    page.wait_for_timeout(250)
+                # --- lsd from the page source when headers never carried it
+                if not found["lsd"]:
+                    try:
+                        found["lsd"] = _extract_lsd_token(page.content())
+                    except Exception:
+                        pass
+                cookies = context.cookies()
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                browser.close()
+    except Exception as e:
+        print(f"[pw-harvest] failed: {type(e).__name__}: {str(e)[:140]}", flush=True)
+        return False
+
+    csrf = next(
+        (c["value"] for c in cookies if c.get("name") == "csrftoken"), ""
+    )
+    doc_id = found["doc_id"] or found["doc_id_any"]
+    if not cookies or not (doc_id or found["lsd"] or csrf):
+        print("[pw-harvest] page loaded but no usable session parameters captured")
+        return False
+
+    _store_pw_session(
+        cookies, found["lsd"], doc_id, ua,
+        template=found.get("template"),
+    )
+    print(
+        f"[pw-harvest] session captured: doc_id={doc_id or 'n/a'} "
+        f"lsd={'yes' if found['lsd'] else 'no'} csrf={'yes' if csrf else 'no'} "
+        f"template={'yes' if found.get('template') else 'no'} "
+        f"({len(cookies)} cookies)",
+        flush=True,
+    )
+    return True
+
+
+def _pw_ensure_session(force: bool = False) -> bool:
+    """Guarantee a usable harvested session, re-extracting when needed.
+
+    Cache-first: a fresh in-memory OR disk session (inside IG_SESSION_TTL,
+    default 12h, 6-12h spec window) is reused with zero browser cost.
+    A session Instagram refused (stamped stale on 400/403/status-fail) or
+    one past its TTL triggers a fresh Playwright harvest. Harvest attempts
+    are spaced >= _PW_REHARVEST_MIN_SECS apart so a broken environment
+    cannot spin the browser on every request.
+
+    Sync-safe: the reentrant lock serializes harvests across threads.
+    Returns True when a usable session exists afterwards."""
+    global _pw_last_harvest
+    with _pw_lock:
+        if not force:
+            _load_pw_session()
+            if _pw_session_active() and _pw_session_fresh():
+                return True
+        if time.monotonic() - _pw_last_harvest < _PW_REHARVEST_MIN_SECS:
+            return _pw_session_active()  # spaced out; use whatever we have
+        _pw_last_harvest = time.monotonic()
+        return _harvest_ig_session()
+
+
+def _pw_cookies_to_httpx() -> Optional[httpx.Cookies]:
+    """Playwright cookie dicts -> httpx cookie jar for the pure-API client."""
+    with _pw_lock:
+        raw = _pw_session.get("cookies")
+        ua = _pw_session.get("ua") or ""
+    if not raw:
+        return None
+    jar = httpx.Cookies()
+    for c in raw:
+        try:
+            jar.set(
+                c.get("name", ""), c.get("value", ""),
+                domain=c.get("domain") or ".instagram.com",
+                path=c.get("path") or "/",
+            )
+        except Exception:
+            pass
+    return jar
+
+
+def _swap_pw_username(body: str, username: str) -> str:
+    """Replace the seed handle inside a captured GraphQL body with the target
+    handle. Handles both the raw JSON form ("username":"instagram") and the
+    percent-encoded form form-urlencoded bodies carry
+    (%22username%22%3A%22instagram%22). Returns the body unchanged when no
+    username field is found."""
+    out, n = re.subn(
+        r'("username"\s*:\s*")[^"]*(")',
+        lambda m: m.group(1) + username + m.group(2),
+        body, count=1,
+    )
+    if n:
+        return out
+    out, n = re.subn(
+        r'(%22username%22(?:%3A|:)%22)[^%"]*(%22)',
+        lambda m: m.group(1) + username + m.group(2),
+        body, count=1,
+    )
+    return out if n else body
+
+
+def _pw_graphql_post(doc_id: str, username: str, headers: Dict[str, str],
+                     cookies: Optional[httpx.Cookies], lsd: str,
+                     raw_body: Optional[str] = None) -> Tuple[int, Optional[Any]]:
+    """One lightweight POST /api/graphql call with the harvested session.
+    raw_body = a captured template body (username already swapped) replayed
+    byte-for-byte; otherwise a minimal form body is constructed.
+    Returns (http_status, parsed_json_or_None)."""
+    with httpx.Client(
+        timeout=_DIRECT_TIMEOUT, follow_redirects=True,
+        cookies=cookies, proxy=_ig_httpx_proxy(),
+    ) as client:
+        if raw_body:
+            resp = client.post(
+                "https://www.instagram.com/api/graphql",
+                content=raw_body.encode("utf-8"),
+                headers=headers,
+            )
+        else:
+            resp = client.post(
+                "https://www.instagram.com/api/graphql",
+                data={
+                    "variables": json.dumps({"username": username}),
+                    "doc_id": doc_id,
+                    "lsd": lsd,
+                    "server_timestamps": "true",
+                },
+                headers=headers,
+            )
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, None
+
+
+def _pw_profile_from_payload(payload: Optional[Any], username: str) -> Optional[ProfileData]:
+    """Extract a usable ProfileData from a user-object payload, or None."""
+    user = ((payload or {}).get("data") or {}).get("user")
+    if isinstance(user, dict):
+        profile = _map_direct_user(user, username)
+        if profile.followers > 0 or profile.recent_posts:
+            return profile
+    return None
+
+
+def _pw_status_is_fail(payload: Optional[Any]) -> bool:
+    """Instagram's app-level refusal: HTTP 200 but {\"status\": \"fail\", ...}
+    (sometimes nested one level down)."""
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or "").lower()
+    if status == "fail":
+        return True
+    return str((payload.get("meta") or {}).get("status") or "").lower() == "fail"
+
+
+def _fetch_pw_api_profile(username: str) -> Optional[ProfileData]:
+    """Pure-API profile fetch with the HARVESTED session — no browser render.
+
+    Ladder inside this rung:
+      1. POST /api/graphql with the harvested doc_id (the web app's own
+         profile query — full user object incl. the 12-post timeline).
+      2. GET web_profile_info with the harvested cookies/lsd/csrf.
+
+    Error handling: HTTP 400 / 403 / 429 or an app-level {"status": "fail"}
+    marks the session stale, triggers ONE automatic re-extraction (a fresh
+    headless harvest of doc_id/lsd/csrftoken) and retries the failed call
+    with the fresh tokens. Only then does it give up and return None so the
+    outer ladder can fall through to the next rung.
+    """
+    if not PW_FETCH_ENABLED:
+        return None
+
+    for attempt in (1, 2):  # 1 = cached session, 2 = after auto re-extract
+        with _pw_lock:
+            doc_id = _pw_session.get("doc_id") or ""
+            lsd = _pw_session.get("lsd") or ""
+            ua = _pw_session.get("ua") or ""
+            template = _pw_session.get("template") or None
+        if not ua:
+            return None  # no harvested session available at all
+
+        cookies = _pw_cookies_to_httpx()
+        csrf = ""
+        if cookies is not None:
+            csrf = cookies.get("csrftoken") or ""
+        if isinstance(template, dict) and isinstance(template.get("headers"), dict):
+            # REPLAY the captured request: the exact header set the page's own
+            # frontend sent (minus cookies/host/content-length, which are
+            # supplied per-connection), so the off-browser call is
+            # indistinguishable from the page's own XHR.
+            headers = {
+                k: v for k, v in template["headers"].items()
+                if k.lower() not in _PW_SKIP_HEADERS and v
+            }
+            headers.setdefault("user-agent", ua)
+        else:
+            headers = {
+                "user-agent": ua,
+                "accept": "*/*",
+                "accept-language": "en-US,en;q=0.9",
+                "x-requested-with": "XMLHttpRequest",
+                "x-ig-app-id": IG_WEB_APP_ID,
+                "origin": "https://www.instagram.com",
+                "referer": f"https://www.instagram.com/{username}/",
+            }
+            if lsd:
+                headers["x-fb-lsd"] = lsd
+            if csrf:
+                headers["x-csrftoken"] = csrf
+
+        session_refused = False  # 400/403/429/status-fail -> re-extract + retry
+
+        # --- Attempt A: the harvested doc_id against /api/graphql ---------
+        # Only worth a call when the doc_id genuinely belongs to the
+        # arbitrary-handle profile query (captured from a username-naming
+        # body, or provided via IG_GQL_DOC_ID). Replaying an unrelated
+        # query's doc_id wastes a round-trip on a guaranteed rejection.
+        # With a captured template the body is replayed byte-for-byte (only
+        # the username swapped) — the faithful form of the request.
+        effective_doc_id = _PW_GQL_DOC_ID_OVERRIDE or doc_id
+        raw_body = None
+        if isinstance(template, dict) and template.get("body"):
+            raw_body = _swap_pw_username(str(template["body"]), username)
+        if effective_doc_id and (template or _PW_GQL_DOC_ID_OVERRIDE):
+            try:
+                status, payload = _pw_graphql_post(
+                    effective_doc_id, username, headers, cookies, lsd,
+                    raw_body=raw_body,
+                )
+            except Exception:
+                status, payload = 0, None
+            if status == 200:
+                profile = _pw_profile_from_payload(payload, username)
+                if profile is not None:
+                    if attempt == 2:
+                        record_fetch_event(
+                            "ok",
+                            f"@{username} via RE-HARVESTED session GraphQL POST "
+                            f"(pure API, {len(profile.recent_posts)} posts)",
+                        )
+                    else:
+                        record_fetch_event(
+                            "ok",
+                            f"@{username} via harvested-session GraphQL POST "
+                            f"(pure API, {len(profile.recent_posts)} posts)",
+                        )
+                    return profile
+                if _pw_status_is_fail(payload):
+                    session_refused = True
+            elif status in (400, 401, 403, 429):
+                session_refused = True
+                record_fetch_event(
+                    "blocked",
+                    f"@{username}: pure-API POST refused (HTTP {status})",
+                )
+            elif status:
+                record_fetch_event(
+                    "blocked",
+                    f"@{username}: pure-API POST HTTP {status}",
+                )
+
+        # --- Attempt B: web_profile_info with the harvested session ------
+        if not session_refused:
+            try:
+                with httpx.Client(
+                    timeout=_DIRECT_TIMEOUT, follow_redirects=True,
+                    cookies=cookies, proxy=_ig_httpx_proxy(),
+                ) as client:
+                    resp = client.get(
+                        "https://www.instagram.com/api/v1/users/web_profile_info/",
+                        params={"username": username},
+                        headers=headers,
+                    )
+                status = resp.status_code
+                if status == 200:
+                    profile = _pw_profile_from_payload(resp.json(), username)
+                    if profile is not None:
+                        record_fetch_event(
+                            "ok",
+                            f"@{username} via harvested-session web_profile_info "
+                            f"(pure API, {len(profile.recent_posts)} posts)",
+                        )
+                        return profile
+                elif status in (400, 401, 403, 429):
+                    session_refused = True
+                    record_fetch_event(
+                        "blocked",
+                        f"@{username}: harvested-session web_profile_info refused (HTTP {status})",
+                    )
+            except Exception:
+                pass
+
+        if not session_refused or attempt == 2:
+            return None  # nothing usable; outer ladder falls through
+
+        # --- Error intercepted: auto re-extract fresh tokens, then retry --
+        print(
+            f"[pw] @{username}: harvested session refused (400/403/status-fail) "
+            "— re-extracting fresh tokens via headless harvest…",
+            flush=True,
+        )
+        _pw_mark_session_stale()
+        if not _pw_ensure_session(force=True):
+            return None  # re-extraction failed; fall through honestly
 
 
 # ---------------------------------------------------------------------------
@@ -1935,6 +2588,22 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
     # ladder (it is the only mode now).
     if os.getenv("IG_FETCH_MODE", "http").lower() == "off":
         raise RuntimeError("DIRECT fetch disabled via IG_FETCH_MODE=off.")
+
+    # --- Fast-fail inside BATCHES: a whole batch must never walk the full
+    # doomed ladder once Instagram has started refusing the data APIs
+    # (401/429 -> _api_block_until). Each candidate otherwise pays the same
+    # bootstrap + Chrome render + Playwright re-harvest (~50s) before
+    # failing — measured 68s+ for a single discover call. Batches instead
+    # fail fast for the cooldown window (the SAME real-data ladder serves
+    # them once the throttle lifts; single get_profile keeps the full
+    # ladder so one dedicated fetch can still break through).
+    if _BATCH_MODE.get("active") and time.monotonic() < _api_block_until:
+        raise RuntimeError(
+            f"Instagram data APIs are in a throttle cooldown "
+            f"({_api_block_until - time.monotonic():.0f}s left); batch fetch "
+            "skipped to keep the request fast — retries automatically."
+        )
+
     cookies, lsd = await asyncio.to_thread(_bootstrap_direct_session)
 
     headers = dict(_DIRECT_HEADERS)
@@ -2041,6 +2710,17 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
         record_fetch_event("ok", f"@{username} stats-only via HTML floor (no posts)")
         return html_floor
 
+    # Inside batches, stop at the HTML floor once Instagram refused the data
+    # APIs: the browser fallbacks (Chrome render, Playwright re-harvest)
+    # spend ~50-90s PER CANDIDATE and re-derive the same refused session.
+    # The stats floor is real data the caller can serve immediately.
+    if _BATCH_MODE.get("active"):
+        if html_floor is not None:
+            return html_floor
+        raise RuntimeError(
+            f"Batch fast-fail: Instagram data APIs throttled for @{username}."
+        )
+
     # Fallback 3: real-Chrome render (keyless). Instagram serves the real
     # logged-out profile page to actual browsers even when plain-HTTP callers
     # are hard-throttled (401/login-wall): exact stats come from the embedded
@@ -2051,6 +2731,20 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
     if chrome_profile is not None:
         perf.stage("real-Chrome render OK")
         return chrome_profile
+
+    # Fallback 3b: Playwright session harvest + pure-API fetch. One real
+    # browser load harvests doc_id/lsd/csrftoken (randomized UA); every
+    # profile after that is a cheap pure-API call with the harvested
+    # session — no full HTML render per profile (CPU/memory saver).
+    # 400/403/status-fail inside the rung auto-re-extracts once and retries
+    # before returning None, so the ladder only falls through on genuine
+    # refusal. When the Apify pool is exhausted/benched this rung is what
+    # keeps real data flowing.
+    if PW_FETCH_ENABLED and _pw_ensure_session():
+        pw_profile = await asyncio.to_thread(_fetch_pw_api_profile, username)
+        if pw_profile is not None:
+            perf.stage("pure-API fetch (harvested session) OK")
+            return pw_profile
 
     # Fallback 4: Tavily extract floor - the cloud-host rung. When every
     # direct layer is throttled (datacenter IPs) and no local Chrome exists,
@@ -2072,7 +2766,10 @@ async def _fetch_direct_profile(username: str) -> ProfileData:
         "or blocking this host's IPs (expected on Vercel/Render datacenter "
         "ranges). Fixes: IG_PROXY_URL (residential proxy), an Apify "
         "token, or "
-        "IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID (official Graph API) — "
+        "IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID (official Graph API); "
+        "the Playwright harvest rung (pip install -r "
+        "requirements-playwright.txt && playwright install chromium) "
+        "harvests a fresh API session when all of those are unavailable — "
         "simulated data is never served."
     )
 
@@ -2400,6 +3097,434 @@ async def discover_related_profiles(username: str, limit: int = 30) -> List[Dict
 
 
 # ---------------------------------------------------------------------------
+# Profession + location competitor discovery (4-step pipeline)
+#
+# STEP 1 (ai_engine.understand_profile_location): LLM extracts profession /
+#         specialty / city / state / audience / search_keywords from the
+#         account's own text (bio keyword fallback when the LLM is down).
+# STEP 2 (find_candidates): swappable candidate providers keyed on those
+#         search keywords:
+#           - 'pool'      curated (profession, city) pool + locally cached
+#                         accounts + IG_POOL_SEEDS env seeds — zero external
+#                         calls
+#           - 'websearch' live web search (site:instagram.com "profession"
+#                         "city") with handles extracted from result URLs
+# STEP 3: every candidate is fetched through the REAL-data get_profile()
+#         pipeline; private / dead / profession-mismatched accounts are
+#         dropped — no fabricated rows are ever served.
+# STEP 4: 0-100 relevance score (profession 40 / city 30 / follower range 20
+#         / activity 10) and a human match_reason per survivor.
+# ---------------------------------------------------------------------------
+
+_CANDIDATE_PROVIDER = (os.getenv("COMPETITOR_CANDIDATE_PROVIDER", "both").strip().lower())
+
+# Curated fallback pool keyed (profession, city|""). REAL handles only —
+# they go through the same fetch+verify ladder as every other candidate, so
+# a stale handle simply drops out. Extend with IG_POOL_SEEDS, e.g.:
+#   IG_POOL_SEEDS="dermatologist:noida=someclinic,some doctor;dentist:delhi=another"
+_CURATED_POOL: Dict[Tuple[str, str], List[str]] = {
+    ("doctor", ""): ["mayoclinic", "clevelandclinic"],
+    ("gym", ""): ["gymshark"],
+    ("fitness coach", ""): ["gymshark"],
+    ("cafe", ""): ["starbucks"],
+    ("bakery", ""): ["starbucks"],
+}
+
+
+def _pool_seeds_from_env() -> Dict[Tuple[str, str], List[str]]:
+    """IG_POOL_SEEDS="prof:city=h1,h2;prof:city2=h3" -> pool dict."""
+    out: Dict[Tuple[str, str], List[str]] = {}
+    raw = (os.getenv("IG_POOL_SEEDS") or "").strip()
+    for group in raw.split(";"):
+        group = group.strip()
+        if "=" not in group or ":" not in group:
+            continue
+        key_part, handles_part = group.split("=", 1)
+        prof, _, city = key_part.partition(":")
+        handles = [
+            h.strip().lstrip("@").lower() for h in handles_part.split(",")
+            if h.strip().lstrip("@")
+        ]
+        if prof.strip() and handles:
+            out[(prof.strip().lower(), city.strip().lower())] = handles
+    return out
+
+
+def _local_profession_candidates(
+    profession: Optional[str], specialty: Optional[str],
+    city: Optional[str], exclude: set, limit: int,
+) -> List[Dict[str, Any]]:
+    """Mine the local REAL-data disk cache for accounts whose own text
+    (bio/name/category) matches the detected profession and — when known —
+    the city. Zero network. Powers the offline test path and gives repeat
+    analyses a growing candidate pool for free."""
+    terms = [t.lower() for t in (profession, specialty) if t]
+    city_l = (city or "").lower()
+    if not terms:
+        return []
+    try:
+        with _cache_conn() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM cache WHERE key LIKE 'profile:%'"
+            ).fetchall()
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for key, value in rows:
+        try:
+            d = json.loads(value)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        h = str(d.get("username") or key.split(":", 1)[1]).strip().lower()
+        if not h or h in exclude or not _USERNAME_RE.match(h):
+            continue
+        text = " ".join([
+            str(d.get("bio") or ""), str(d.get("full_name") or ""),
+            str(d.get("category") or ""),
+        ]).lower()
+        if not any(t in text for t in terms):
+            continue
+        if city_l and city_l not in text:
+            continue  # profession matched but wrong/unknown city — skip
+        out.append({
+            "username": h,
+            "full_name": str(d.get("full_name") or ""),
+            "bio": str(d.get("bio") or "")[:200],
+            "followers": int(d.get("followers") or 0),
+            "verified": bool(d.get("is_verified")),
+            "private": False,
+            "source": "local-cache",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _pool_candidates(
+    profession: Optional[str], specialty: Optional[str], city: Optional[str],
+    exclude: set, limit: int,
+) -> List[Dict[str, Any]]:
+    """Curated-pool candidate provider (zero external calls): env seeds +
+    built-in pool with (profession, city) -> profession-only fallback, plus
+    niche-matching accounts already in the local REAL-data cache."""
+    pools = dict(_CURATED_POOL)
+    pools.update(_pool_seeds_from_env())
+    handles: List[str] = []
+    city_key = (city or "").lower()
+    prof_keys = [p for p in (specialty, profession) if p]
+    for prof in prof_keys:
+        key = (prof.lower(), city_key)
+        handles.extend(pools.get(key, []))          # profession + city
+        handles.extend(pools.get((prof.lower(), ""), []))  # profession only
+
+    seen: set = set(exclude)
+    out: List[Dict[str, Any]] = []
+    for h in handles:
+        hl = h.lower()
+        if hl in seen or not _USERNAME_RE.match(hl):
+            continue
+        seen.add(hl)
+        out.append({
+            "username": hl, "full_name": "", "bio": "",
+            "followers": 0, "verified": False, "private": False,
+            "source": "pool",
+        })
+        if len(out) >= limit:
+            return out
+
+    # Top up from accounts already analyzed locally (real cached data).
+    out.extend(_local_profession_candidates(
+        profession, specialty, city, seen, limit - len(out),
+    ))
+    return out
+
+
+def _websearch_candidates(
+    keywords: List[str], exclude: set, limit: int,
+) -> List[Dict[str, Any]]:
+    """Web-search candidate provider: 'site:instagram.com "profession"
+    "city"' style queries; handles extracted from result URLs."""
+    try:
+        import websearch
+    except Exception:
+        return []
+    if not websearch.available():
+        return []
+    queries = [f"site:instagram.com {kw}" for kw in (keywords or [])[:4]]
+    seen: set = set(exclude) | websearch._RESERVED_PATHS
+    out: List[Dict[str, Any]] = []
+    for q in queries:
+        try:
+            results = websearch.search_web(q, max_results=10)
+        except Exception:
+            results = []
+        for r in results:
+            for url in (r.get("url"), r.get("link"),
+                        " ".join(r.get("snippets") or []) if isinstance(r.get("snippets"), list) else r.get("snippet")):
+                if not url:
+                    continue
+                h = websearch._handle_from_url(str(url))
+                if not h or h in seen or not _USERNAME_RE.match(h):
+                    continue
+                seen.add(h)
+                out.append({
+                    "username": h, "full_name": "", "bio": "",
+                    "followers": 0, "verified": False, "private": False,
+                    "source": "websearch",
+                })
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def find_candidates(
+    keywords: List[str],
+    profession: Optional[str] = None,
+    specialty: Optional[str] = None,
+    city: Optional[str] = None,
+    exclude: Optional[set] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """STEP 2 — swappable candidate providers. COMPETITOR_CANDIDATE_PROVIDER
+    selects: 'pool' (curated, zero external calls), 'websearch' (live search
+    API), or 'both' (default: pool first, websearch tops up)."""
+    exclude = set(exclude or set())
+    limit = max(1, min(limit, 30))
+    out: List[Dict[str, Any]] = []
+    if _CANDIDATE_PROVIDER in ("pool", "both"):
+        out = _pool_candidates(profession, specialty, city, exclude, limit)
+    if _CANDIDATE_PROVIDER in ("websearch", "both") and len(out) < limit:
+        have = {c["username"] for c in out} | exclude
+        out.extend(_websearch_candidates(keywords, have, limit - len(out)))
+    return out[:limit]
+
+
+def _profession_text_hits(profile: ProfileData, terms: List[str]) -> bool:
+    """True when any profession/specialty term appears in the account's own
+    text (bio, name, category, captions, hashtags)."""
+    text = " ".join([
+        (profile.bio or ""), (profile.full_name or ""), (profile.category or ""),
+        " ".join((p.caption or "") for p in (profile.recent_posts or [])[:10]),
+    ]).lower()
+    return any(t in text for t in terms if t)
+
+
+def _city_text_hit(profile: ProfileData, city: Optional[str]) -> bool:
+    if not city:
+        return False
+    text = " ".join([
+        (profile.bio or ""), (profile.full_name or ""), (profile.category or ""),
+        " ".join((p.caption or "") for p in (profile.recent_posts or [])[:10]),
+    ]).lower()
+    return city.lower() in text
+
+
+def _score_profession_candidate(
+    profile: ProfileData,
+    main_followers: int,
+    profession: Optional[str],
+    specialty: Optional[str],
+    city: Optional[str],
+    prof_terms: List[str],
+) -> Tuple[int, Optional[str]]:
+    """STEP 4 — 0-100 score + 'why this is a competitor' reason.
+
+    profession/specialty match 40 | same city 30 | follower range (0.3x-3x)
+    20 | recent activity 10."""
+    score = 0
+    text = " ".join([
+        (profile.bio or ""), (profile.full_name or ""), (profile.category or ""),
+        " ".join((p.caption or "") for p in (profile.recent_posts or [])[:10]),
+    ]).lower()
+
+    spec_hit = bool(specialty) and specialty.lower() in text
+    prof_hit = _profession_text_hits(profile, prof_terms)
+    if spec_hit:
+        score += 40
+    elif prof_hit:
+        score += 25
+
+    city_hit = _city_text_hit(profile, city)
+    if city_hit:
+        score += 30
+
+    ratio = (profile.followers / main_followers) if main_followers > 0 else 0
+    if 0.3 <= ratio <= 3.0:
+        score += 20
+    elif 0.1 <= ratio <= 10.0:
+        score += 10
+
+    days = [p.posted_days_ago for p in (profile.recent_posts or [])
+            if p.posted_days_ago is not None]
+    newest = min(days) if days else None
+    if newest is not None and newest <= 7:
+        score += 10
+    elif newest is not None and newest <= 14:
+        score += 7
+    elif newest is not None and newest <= 30:
+        score += 4
+
+    # --- reason -----------------------------------------------------------
+    what = (specialty or profession or "Account").strip().capitalize()
+    where = f" in {city}" if city_hit and city else ""
+    size = f", {ratio:.1f}x your followers" if main_followers > 0 and ratio > 0 else ""
+    freq = ""
+    try:
+        import ai_engine as _ai
+        m = _ai.compute_metrics(profile)
+        if m.posting_frequency_per_week > 0:
+            freq = f", posts {m.posting_frequency_per_week:g}x/week"
+    except Exception:
+        pass
+    recent = "" if (newest is not None and newest <= 30) else ", low recent activity"
+    reason = f"{what}{where}{size}{freq}{recent}" or "Matched your profession"
+    return min(100, score), reason
+
+
+async def discover_profession_competitors(
+    username: str,
+    limit: int = 10,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """FULL profession+location discovery pipeline (steps 1-4).
+
+    Returns (rows, meta). Each row: {username, full_name, bio, followers,
+    verified, private, profession, specialty, city, match_score,
+    match_reason, source}. meta: {profession, specialty, city, state,
+    audience_type, search_keywords, understanding_source,
+    location_detected, candidates_found}.
+
+    Never raises for provider failures — degradation is honest via meta and
+    empty lists. All candidate data comes from the REAL get_profile()
+    pipeline; private/dead/mismatched accounts are dropped (step 3)."""
+    username = normalize_username(username)
+    meta: Dict[str, Any] = {
+        "profession": None, "specialty": None, "city": None, "state": None,
+        "audience_type": None, "search_keywords": [],
+        "understanding_source": None, "location_detected": None,
+        "candidates_found": 0,
+    }
+
+    # Result cache: the pipeline runs an LLM chain + candidate search + a
+    # batch fetch of every candidate — repeat calls within a day are served
+    # instantly from disk instead of paying that cost again (competitor sets
+    # drift slowly; the same TTL the related-accounts path uses).
+    cache_key = f"profdisco:{username}:{limit}"
+    disk = await asyncio.to_thread(_cache_get, cache_key, _DISK_TTL_DISCOVERY)
+    if isinstance(disk, dict) and isinstance(disk.get("rows"), list):
+        return disk["rows"], (disk.get("meta") or meta)
+    if isinstance(disk, list) and disk:
+        return disk, meta  # legacy shape
+
+    # --- the input account itself (real pipeline, cache-aware) ---
+    try:
+        main_profile = await get_profile(username)
+    except (ValueError, RuntimeError, httpx.HTTPError) as e:
+        meta["error"] = str(e)[:200]
+        return [], meta
+
+    # --- STEP 1: understand the account (LLM, bio-keyword fallback) ---
+    try:
+        import ai_engine as _ai
+        prof, source = _ai.understand_profile_location(main_profile)
+    except Exception:
+        prof, source = {
+            "profession": None, "specialty": None, "city": None,
+            "state": None, "audience_type": None, "search_keywords": [],
+        }, "keywords"
+    meta.update(prof)
+    meta["understanding_source"] = source
+    meta["location_detected"] = bool(prof.get("city"))
+    if not prof.get("profession") and not prof.get("city"):
+        # Nothing to search on — honest empty result, caller falls back to
+        # the related-accounts discovery path.
+        return [], meta
+
+    # --- STEP 2: candidates from the swappable providers ---
+    exclude = {username.lower()}
+    keywords = list(prof.get("search_keywords") or [])
+    if prof.get("profession") and prof.get("city"):
+        base = f"{prof['specialty'] or prof['profession']} {prof['city']}"
+        if base.lower() not in {k.lower() for k in keywords}:
+            keywords.insert(0, base)
+    candidates = await asyncio.to_thread(
+        find_candidates, keywords, prof.get("profession"),
+        prof.get("specialty"), prof.get("city"), exclude,
+        # Fetch budget: enough to survive verification drop-off (private/
+        # dead/mismatched candidates) without triple-fetching for a top-up
+        # queue nobody reads. limit + 8 covers the >=5 guarantee with headroom.
+        max(limit + 8, 12),
+    )
+    meta["candidates_found"] = len(candidates)
+    if not candidates:
+        return [], meta
+
+    # --- STEP 3: verify + enrich through the REAL data pipeline ---
+    handles = [c["username"] for c in candidates]
+    try:
+        fetched = await get_profiles_batch(handles)
+    except Exception:
+        fetched = {}
+
+    prof_terms = [
+        t.lower() for t in {
+            prof.get("profession"), prof.get("specialty"),
+            *(keywords or []),
+        } if t
+    ]
+    main_followers = main_profile.followers
+    verified_rows: List[Dict[str, Any]] = []
+    for c in candidates:
+        p = fetched.get(c["username"].lower())
+        if p is None:
+            continue  # unavailable — honest drop
+        # Viable-competitor gate: a real competitor has an audience AND recent
+        # content. Stats-floor rows (tiny/abandoned accounts Instagram served
+        # only a header for — e.g. 5 followers, no posts) are not researchable
+        # rivals: comparative metrics would be meaningless. Dropped honestly.
+        if p.followers < 100:
+            continue
+        if not p.recent_posts:
+            continue
+        # Dead check: no post in 90 days.
+        days = [q.posted_days_ago for q in (p.recent_posts or [])
+                if q.posted_days_ago is not None]
+        if days and max(days) > 90:
+            continue
+        # Profession check: the account's own text must corroborate.
+        if prof.get("profession") and not _profession_text_hits(p, prof_terms):
+            continue
+        score, reason = _score_profession_candidate(
+            p, main_followers, prof.get("profession"),
+            prof.get("specialty"), prof.get("city"), prof_terms,
+        )
+        verified_rows.append({
+            "username": p.username,
+            "full_name": p.full_name or "",
+            "bio": p.bio or "",
+            "followers": p.followers,
+            "verified": bool(p.is_verified),
+            "private": False,
+            "profession": prof.get("profession"),
+            "specialty": prof.get("specialty"),
+            "city": prof.get("city") if _city_text_hit(p, prof.get("city")) else None,
+            "match_score": score,
+            "match_reason": reason,
+            "source": c.get("source", ""),
+        })
+
+    # --- STEP 4: rank and cut ---
+    verified_rows.sort(key=lambda r: r["match_score"], reverse=True)
+    final_rows = verified_rows[:limit]
+    if final_rows:
+        await asyncio.to_thread(_cache_set, cache_key, {
+            "rows": final_rows, "meta": meta,
+        })
+    return final_rows, meta
+
+
+# ---------------------------------------------------------------------------
 # Public entrypoints
 # ---------------------------------------------------------------------------
 
@@ -2565,18 +3690,24 @@ async def get_profiles_batch(usernames: List[str]) -> Dict[str, ProfileData]:
     # A ValueError (handle does not exist) SKIPS the handle in batch context —
     # the caller surfaces it as a warning — while single get_profile raises
     # the honest 400. One dead rival handle must not kill a research batch.
+    # _BATCH_MODE makes the ladder fast-fail during an Instagram throttle
+    # instead of paying the full browser ladder per candidate.
     if failed and DIRECT_FETCH_ENABLED:
-        for i, u in enumerate(failed):
-            if i:
-                await asyncio.sleep(1.5)  # pace sequential unauthenticated hits
-            try:
-                profile = await _fetch_direct_profile(u)
-            except (ValueError, RuntimeError, httpx.HTTPError):
-                continue  # caller surfaces missing handles as warnings
-            await asyncio.to_thread(_disk_profile_set, u, profile)
-            async with _CACHE_LOCK:
-                _profile_cache[u] = (time.monotonic(), profile)
-            result[u] = profile
+        _BATCH_MODE["active"] = True
+        try:
+            for i, u in enumerate(failed):
+                if i and time.monotonic() >= _api_block_until:
+                    await asyncio.sleep(1.5)  # pace unauthenticated hits only when they can actually run
+                try:
+                    profile = await _fetch_direct_profile(u)
+                except (ValueError, RuntimeError, httpx.HTTPError):
+                    continue  # caller surfaces missing handles as warnings
+                await asyncio.to_thread(_disk_profile_set, u, profile)
+                async with _CACHE_LOCK:
+                    _profile_cache[u] = (time.monotonic(), profile)
+                result[u] = profile
+        finally:
+            _BATCH_MODE["active"] = False
 
     return result
 
@@ -2584,6 +3715,13 @@ async def get_profiles_batch(usernames: List[str]) -> Dict[str, ProfileData]:
 # ---------------------------------------------------------------------------
 # Diagnostics — fetch-event ring buffer + environment snapshot (cloud debug)
 # ---------------------------------------------------------------------------
+
+# Batch-context flag: True while get_profiles_batch runs its live-fetch
+# section. The keyless direct ladder reads this to FAST-FAIL during an
+# Instagram throttle (see _fetch_direct_profile) instead of walking the full
+# doomed browser ladder per candidate — batches return in seconds, and the
+# same real-data ladder serves everything once the throttle lifts.
+_BATCH_MODE: Dict[str, bool] = {"active": False}
 
 _FETCH_EVENTS: deque = deque(maxlen=50)  # (at, kind, detail) — most recent last
 
@@ -2737,6 +3875,18 @@ async def get_profile(username: str) -> ProfileData:
     # a professional account) raises ValueError immediately with a clear
     # message; a TOKEN/app failure only logs and falls through to the next
     # provider so one expired key never takes the app down.
+    if PW_FETCH_ENABLED and _PW_PREFERRED and username not in _selfheal_attempted:
+        _selfheal_attempted.add(username)  # one rung-first attempt per handle
+        try:
+            if _pw_ensure_session():
+                pw = await asyncio.to_thread(_fetch_pw_api_profile, username)
+                if pw is not None and pw.recent_posts:
+                    await asyncio.to_thread(_disk_profile_set, username, pw)
+                    async with _CACHE_LOCK:
+                        _profile_cache[username] = (time.monotonic(), pw)
+                    return pw
+        except (ValueError, RuntimeError, httpx.HTTPError):
+            pass  # rung refused — the normal ladder takes over
     if _has_graph_credentials():
         try:
             profile = await fetch_live_profile(username)

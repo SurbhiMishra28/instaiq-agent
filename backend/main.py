@@ -1,6 +1,7 @@
 import os
 import asyncio
 import sys as _sys
+import httpx
 from concurrent.futures import ThreadPoolExecutor
 
 # Windows consoles default to a cp1252 stream that cannot encode characters
@@ -568,6 +569,48 @@ async def analyze(req: AnalyzeRequest):
     return insight
 
 
+def _niche_tokens(profile) -> set:
+    """Content words from an account's own text (bio, name, category,
+    captions, hashtags) — the account's niche vocabulary. Generic words are
+    stripped so 'instagram', 'follow', 'official' never fake a match."""
+    import re as _re
+    text = " ".join([
+        getattr(profile, "bio", "") or "",
+        getattr(profile, "full_name", "") or "",
+        getattr(profile, "category", "") or "",
+    ])
+    for p in (getattr(profile, "recent_posts", None) or [])[:10]:
+        text += " " + (getattr(p, "caption", "") or "")
+        text += " " + " ".join(getattr(p, "hashtags", None) or [])
+    stop = {
+        "instagram", "follow", "following", "followers", "post", "posts",
+        "official", "account", "page", "like", "likes", "comment", "comments",
+        "the", "and", "for", "with", "your", "you", "our", "this", "that",
+        "from", "are", "was", "were", "have", "has", "will", "can", "get",
+        "all", "out", "about", "more", "new", "one", "two", "who", "what",
+        "www", "http", "https", "com", "dm", "link", "bio", "today",
+    }
+    words = _re.findall(r"[a-z][a-z'&-]{2,}", text.lower())
+    return {w for w in words if w not in stop}
+
+
+def _niche_similarity(main_profile, candidate) -> int:
+    """Niche-match strength between the main account and a candidate:
+    shared content words + a bonus for the same Instagram category. Used to
+    keep random accounts (city halls, mayors, game pages) OUT of the
+    competitor list — a rival must talk about the same things."""
+    a = _niche_tokens(main_profile)
+    b = _niche_tokens(candidate)
+    overlap = len(a & b) if a and b else 0
+    same_cat = (
+        getattr(main_profile, "category", None)
+        and getattr(candidate, "category", None)
+        and str(main_profile.category).strip().lower()
+        == str(candidate.category).strip().lower()
+    )
+    return overlap + (3 if same_cat else 0)
+
+
 async def _research_competitors(main_username: str, main_profile: ProfileData, count: int):
     """Find + research competitors for the main account.
 
@@ -577,14 +620,30 @@ async def _research_competitors(main_username: str, main_profile: ProfileData, c
     Returns (main_insight, insights, warnings, candidates_found, rationale).
     """
     fallback_note: Optional[str] = None
+    prof_meta: dict = {}
     try:
-        candidates = await scraper.discover_related_profiles(main_username, limit=30)
-    except RuntimeError as e:
-        # Live provider unavailable (quota, token, network) — don't dead-end:
-        # degrade to cached real rivals instead of failing the request.
-        fallback_note = f"Auto-discovery unavailable ({e}) — using accounts already analyzed in this app as approximate rivals."
-    except Exception as e:
-        fallback_note = f"Auto-discovery failed ({e}) — using accounts already analyzed in this app as approximate rivals."
+        # PRIMARY: profession+location discovery (steps 1-2 here; steps 3-4
+        # run after the batch fetch). Falls back to related-accounts below.
+        try:
+            prof_rows, prof_meta = await scraper.discover_profession_competitors(
+                main_username, limit=30
+            )
+        except Exception:
+            prof_rows, prof_meta = [], {}
+        if prof_rows:
+            candidates = prof_rows
+        else:
+            raise ValueError("no profession candidates")
+    except Exception:
+        prof_meta = {}
+        try:
+            candidates = await scraper.discover_related_profiles(main_username, limit=30)
+        except RuntimeError as e:
+            # Live provider unavailable (quota, token, network) — don't dead-end:
+            # degrade to cached real rivals instead of failing the request.
+            fallback_note = f"Auto-discovery unavailable ({e}) — using accounts already analyzed in this app as approximate rivals."
+        except Exception as e:
+            fallback_note = f"Auto-discovery failed ({e}) — using accounts already analyzed in this app as approximate rivals."
 
     if not candidates:
         try:
@@ -610,24 +669,44 @@ async def _research_competitors(main_username: str, main_profile: ProfileData, c
     # Parallelize the two slow steps: rival selection (LLM) and the main
     # account's own narrative (LLM) are independent — run them CONCURRENTLY
     # instead of back-to-back (~saves one full LLM round-trip).
+    # When the profession pipeline already produced SCORED candidates, skip
+    # the LLM pick — they are already ranked by the 100-pt relevance score
+    # (and their rows carry the match metadata).
+    # AT LEAST 5: the research always aims for max(count, 5) verified rivals
+    # (count is the UI's requested shortlist size; 5 is the product minimum
+    # for a meaningful comparison). Top-up sources fill the gap below.
+    target = max(count, 5)
     main_task = asyncio.ensure_future(_analyze_one(main_profile))
     try:
-        picked, rationale = await _llm_call(ai_engine.pick_competitors, main_profile, candidates, count)
+        if prof_rows:
+            picked = [r["username"] for r in prof_rows[:target]]
+            rationale = (
+                f"Top matches for profession '{prof_meta.get('profession')}'"
+                + (f" in {prof_meta.get('city')}" if prof_meta.get("city") else " (city undetected — profession-wide)")
+                + f", ranked by the 0-100 relevance score."
+            )
+        else:
+            picked, rationale = await _llm_call(ai_engine.pick_competitors, main_profile, candidates, target)
     except BaseException:
         main_task.cancel()
         raise
 
-    main_insight = await main_task
-
     # ONE batched fetch for all rivals (cache-aware; big latency win vs N runs).
+    # Started WITHOUT awaiting the main narrative first: the LLM narrative
+    # and the rival fetch run at the same time; the narrative is awaited
+    # only after the fetch wave is launched.
+    fetch_task = asyncio.ensure_future(scraper.get_profiles_batch(picked))
+
+    main_insight = await main_task
     try:
-        profiles = await scraper.get_profiles_batch(picked)
+        profiles = await fetch_task
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not fetch competitor profiles: {e}")
 
     have = [profiles[u.lower()] for u in picked if profiles.get(u.lower()) is not None]
+    have_users = {p.username.lower() for p in have}
     warnings = [
         f"@{u}: no data returned (profile may be private or unavailable)."
         for u in picked if profiles.get(u.lower()) is None
@@ -635,17 +714,139 @@ async def _research_competitors(main_username: str, main_profile: ProfileData, c
     if fallback_note:
         warnings.insert(0, fallback_note)
 
+    # --- AT LEAST 5: top-up ladder (all REAL data, no fabrication) ---------
+    # When the first wave served fewer than the target, pull more candidate
+    # handles — remaining scored profession rows first, then related-account
+    # candidates, then accounts already analyzed locally — and fetch only
+    # what is still missing. Every wave goes through the same real-data
+    # fetch; nothing is invented to hit the number.
+    target = max(count, 5)
+    _prof_rows_extra: list = []
+    if len(have) < target:
+        queue: list = []
+        seen = have_users | {main_profile.username.lower()}
+        for r in (prof_rows or [])[target:]:
+            u = str(r.get("username") or "").lower()
+            if u and u not in seen:
+                seen.add(u)
+                queue.append((u, r))
+        try:
+            rel = await scraper.discover_related_profiles(main_username, limit=30)
+        except Exception:
+            rel = []
+        for c in rel:
+            u = str(c.get("username") or "").lower()
+            if u and u not in seen:
+                seen.add(u)
+                queue.append((u, None))
+        try:
+            local_pool = await scraper.get_cached_profile_pool(
+                exclude={main_profile.username.lower()}, limit=30
+            )
+        except Exception:
+            local_pool = []
+        for c in local_pool:
+            u = str(c.get("username") or "").lower()
+            if u and u not in seen:
+                seen.add(u)
+                queue.append((u, None))
+
+        def _viable(p) -> bool:
+            """Same viability bar as the discovery pipeline: a top-up rival
+            must have an audience and content to compare against."""
+            return (
+                p is not None
+                and getattr(p, "followers", 0) >= 100
+                and bool(getattr(p, "recent_posts", []))
+            )
+
+        # RELEVANCE GATE: a top-up account must actually share the main
+        # account's niche (shared content words / same category). This is
+        # what keeps mayors, city halls and game pages out when the input is
+        # a clinic — a competitor "according to the IG account", not a
+        # random profile that happened to be cached or loosely related.
+        min_sim = int(os.getenv("COMPETITOR_MIN_NICHE_SIM", "1"))
+
+        # SPEED: fetch the whole top-up queue in ONE batched wave (one actor
+        # run / one cache sweep) instead of one ladder per candidate, then
+        # score locally. Cap the queue so a thin niche never explodes the
+        # request (24 extra candidates max).
+        topup_handles = [u for u, _r in queue[:24]]
+        fetched_map: dict = {}
+        if topup_handles:
+            try:
+                fetched_map = await scraper.get_profiles_batch(topup_handles)
+            except Exception:
+                fetched_map = {}
+
+        viable: list = []
+        near: list = []   # similarity below the bar — used only if nothing better
+        weak: list = []   # no posts/audience — last resort
+        for u, row in queue:
+            if len(have) >= target:
+                break
+            p = fetched_map.get(u)
+            if p is None or p.username.lower() in have_users:
+                continue
+            have_users.add(p.username.lower())
+            if not _viable(p):
+                weak.append((p, row))
+                continue
+            sim = _niche_similarity(main_profile, p)
+            if sim >= max(min_sim, 2):
+                viable.append((p, row, sim))
+            elif sim >= min_sim:
+                near.append((p, row, sim))
+            else:
+                weak.append((p, row))
+        # Fill order: strongest niche match first, then near matches, weak
+        # rows never (a wrong-niche rival is worse than a shorter list —
+        # the honest warning below explains the shortfall).
+        viable.sort(key=lambda t: t[2], reverse=True)
+        for p, row, _s in viable + near:
+            if len(have) >= target:
+                break
+            have.append(p)
+            if row is not None:
+                # keep the profession match metadata on topped-up rivals
+                row["username"] = p.username
+                _prof_rows_extra.append(row)
+        if len(have) < target:
+            warnings.append(
+                f"Found {len(have)} close competitors for this account — "
+                "fewer strongly matching accounts exist in this niche yet."
+            )
+
     # Rivals via the INSTANT rule-based path — their numbers (ER, cadence,
     # followers), which drive ranking and gap analysis, are identical; the
     # ~20s LLM narrative per rival is the single biggest latency cost on the
     # free NVIDIA tier.
     insights = await asyncio.get_event_loop().run_in_executor(_LLM_POOL, _analyze_fast, have)
+    # Attach profession+location match metadata (from the scored candidate
+    # rows, including topped-up ones) to each rival insight, so the UI cards
+    # can show match_reason.
+    prof_rows_by_user = {
+        r.get("username", "").lower(): r
+        for r in list(prof_rows or []) + _prof_rows_extra
+    }
+    for ins in insights:
+        row = prof_rows_by_user.get(ins.profile.username.lower())
+        if row is not None:
+            ins.profession = row.get("profession")
+            ins.specialty = row.get("specialty")
+            ins.city = row.get("city")
+            ins.match_reason = row.get("match_reason")
     for ins in insights:
         w = _data_quality_warning(ins)
         if w:
             warnings.append(w)
+    if prof_meta.get("profession") and not prof_meta.get("city"):
+        warnings.append("Could not detect location, showing profession-wide matches")
 
-    return main_insight, insights, warnings, len(candidates), rationale
+    return (
+        main_insight, insights, warnings, len(candidates), rationale,
+        prof_meta.get("location_detected"),
+    )
 
 
 @app.post("/api/competitor-research", response_model=CompetitorResearchResponse)
@@ -662,7 +863,8 @@ async def competitor_research(req: AnalyzeRequest, count: int = Query(5, ge=1, l
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not fetch profile: {e}")
 
-    main_insight, competitor_insights, extra_warnings, candidates_found, rationale = await _research_competitors(
+    (main_insight, competitor_insights, extra_warnings, candidates_found,
+     rationale, location_detected) = await _research_competitors(
         req.username, main_profile, count
     )
     storage.record_scan(main_insight)  # best-effort trend tracking
@@ -684,6 +886,7 @@ async def competitor_research(req: AnalyzeRequest, count: int = Query(5, ge=1, l
             ranking=[main_insight.profile.username],
             warnings=warnings,
             candidates_found=candidates_found,
+            location_detected=location_detected,
         )
 
     research = await _llm_call(ai_engine.build_market_research, main_insight, competitor_insights)
@@ -703,13 +906,84 @@ async def competitor_research(req: AnalyzeRequest, count: int = Query(5, ge=1, l
         ranking=ranking,
         warnings=warnings,
         candidates_found=candidates_found,
+        location_detected=location_detected,
     )
 
 
 @app.post("/api/discover", response_model=list[DiscoveredCompetitor])
 async def discover(req: AnalyzeRequest, limit: int = Query(10, ge=1, le=30)):
-    """List candidate competitors Instagram surfaces for a handle (cheap —
-    one profile fetch, no per-competitor research)."""
+    """Competitor candidates for a handle.
+
+    PRIMARY: the profession+location pipeline — an LLM reads the account's
+    bio/captions (profession, specialty, city), candidates come from the
+    swappable find_candidates() providers (curated pool / live web search),
+    each is verified through the real fetch pipeline, and survivors are
+    scored 0-100 with a match_reason.
+
+    FALLBACK: when profession/city cannot be detected (or the pipeline finds
+    nothing), the original related-accounts discovery runs — so the endpoint
+    always returns the best available candidates, never crashes."""
+    try:
+        rows, meta = await scraper.discover_profession_competitors(req.username, limit=limit)
+    except Exception as e:
+        rows, meta = [], {"error": str(e)[:160]}
+
+    if rows:
+        # AT LEAST `limit` rows: the strict profession gate may verify fewer
+        # candidates than requested. Top up from the related-accounts
+        # discovery (real candidates, marked with profession context and no
+        # match score) so the preview never comes back artificially thin.
+        out = [
+            DiscoveredCompetitor(
+                username=r.get("username", ""),
+                full_name=r.get("full_name", ""),
+                bio=r.get("bio", ""),
+                followers=r.get("followers", 0),
+                verified=bool(r.get("verified")),
+                private=False,
+                profession=r.get("profession"),
+                specialty=r.get("specialty"),
+                city=r.get("city"),
+                match_reason=r.get("match_reason"),
+                match_score=r.get("match_score"),
+            )
+            for r in rows
+        ]
+        if len(out) < limit:
+            have = {c.username.lower() for c in out} | {
+                (req.username or "").strip().lstrip("@").lower()
+            }
+            try:
+                extra = await scraper.discover_related_profiles(req.username, limit=limit)
+            except Exception:
+                extra = []
+            for c in extra:
+                if len(out) >= limit:
+                    break
+                u = str(c.get("username") or "").lower()
+                if not u or u in have:
+                    continue
+                have.add(u)
+                out.append(DiscoveredCompetitor(
+                    username=u,
+                    full_name=c.get("full_name", ""),
+                    bio=c.get("bio", ""),
+                    followers=c.get("followers", 0),
+                    verified=bool(c.get("verified")),
+                    private=bool(c.get("private")),
+                    profession=meta.get("profession"),
+                    specialty=meta.get("specialty"),
+                    city=None,
+                    match_reason=(
+                        "Could not detect location, showing profession-wide matches"
+                        if meta.get("profession") and not meta.get("city")
+                        else "Related account — profession not confirmed"
+                    ),
+                    match_score=None,
+                ))
+        return out
+
+    # --- Fallback: related-accounts discovery (legacy path) ---
     try:
         candidates = await scraper.discover_related_profiles(req.username, limit=limit)
     except ValueError as e:
@@ -719,14 +993,23 @@ async def discover(req: AnalyzeRequest, limit: int = Query(10, ge=1, le=30)):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not discover competitors: {e}")
 
+    note = (
+        "Could not detect location, showing profession-wide matches"
+        if meta.get("profession") and not meta.get("city") else None
+    )
     return [
         DiscoveredCompetitor(
             username=c.get("username", ""),
             full_name=c.get("full_name", ""),
-            bio=c.get("bio", ""),
+            bio=(note + " — " if note else "") + (c.get("bio", "") or "") if note else c.get("bio", ""),
             followers=c.get("followers", 0),
             verified=bool(c.get("verified")),
             private=bool(c.get("private")),
+            profession=meta.get("profession"),
+            specialty=meta.get("specialty"),
+            city=None,
+            match_reason=note,
+            match_score=None,
         )
         for c in candidates
     ]

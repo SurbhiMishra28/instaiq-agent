@@ -581,6 +581,11 @@ export default function App() {
                 )}
                 {research.competitors?.length > 0 && (
                   <>
+                    {research.location_detected === false && (
+                      <p className="section-label" style={{ color: 'var(--paper-dim)', fontStyle: 'italic' }}>
+                        Could not detect location, showing profession-wide matches
+                      </p>
+                    )}
                     <p className="section-label">Rival readouts</p>
                     {research.competitors.map((c) => (
                       <div className="competitor-block" key={c.profile.username}>

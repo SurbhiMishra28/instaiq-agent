@@ -118,7 +118,10 @@ def test_local_discovery():
     conn.commit()
     conn.close()
 
-    rows = scraper._local_discover_sync("disco_main", 10)
+    # Large limit: the cache may hold many real rows from live use, and the
+    # assertion is about PRESENCE of the seeded mention/overlap rivals, not
+    # their rank against unrelated cached accounts.
+    rows = scraper._local_discover_sync("disco_main", 50)
     names = [r["username"] for r in rows]
     assert "disco_rival1" in names and "disco_rival2" in names, names
     print("local discovery mines cached mentions: OK")
@@ -283,6 +286,208 @@ def test_no_demo_machinery():
     print("no demo/simulated machinery in scraper: OK")
 
 
+def test_pw_doc_id_extraction():
+    """doc_id extraction from real-shaped GraphQL request bodies."""
+    cases = {
+        'av=0&doc_id=23996118476800820&lsd=ABC123': "23996118476800820",
+        'variables={"username":"gymshark"}&doc_id=9510064595728286': "9510064595728286",
+        '{"doc_id":"17911194528752944","variables":"{"username":"x"}"}': "17911194528752944",
+        'doc_id=12345': "",  # too short -> not a persisted-query hash
+        'no doc id here': "",
+        '': "",
+    }
+    for body, expected in cases.items():
+        got = scraper._extract_doc_id(body)
+        assert got == expected, f"_extract_doc_id({body!r}) = {got!r}, want {expected!r}"
+    print("doc_id extraction: OK")
+
+
+def test_pw_session_roundtrip():
+    """Harvested-session storage -> disk persistence -> reload, and that an
+    empty session is honestly inactive."""
+    old_file = scraper._PW_HARVEST_FILE
+    try:
+        scraper._PW_HARVEST_FILE = old_file + ".sanity_tmp"
+        cookies = [{"name": "csrftoken", "value": "testcsrf123", "domain": ".instagram.com", "path": "/"}]
+        scraper._store_pw_session(cookies, "test-lsd-token", "23996118476800820", "TestUA/1.0")
+        assert scraper._pw_session_active(), "stored session must be active"
+        # Disk reload path: wipe memory, load from file.
+        scraper._pw_session.update({"cookies": None, "lsd": "", "doc_id": "", "ua": "", "ts": 0.0})
+        scraper._load_pw_session()
+        assert scraper._pw_session_active(), "session must reload from disk"
+        assert scraper._pw_session["doc_id"] == "23996118476800820"
+        assert scraper._pw_session["ua"] == "TestUA/1.0"
+        # httpx cookie jar conversion.
+        jar = scraper._pw_cookies_to_httpx()
+        assert jar is not None and jar.get("csrftoken") == "testcsrf123"
+        # UA randomizer returns realistic pairs.
+        for _ in range(6):
+            ua, plat = scraper._pw_random_ua()
+            assert ua.startswith("Mozilla/5.0") and plat in ("Windows", "Mac OS X", "Linux")
+    finally:
+        scraper._pw_session.update({"cookies": None, "lsd": "", "doc_id": "", "ua": "", "ts": 0.0})
+        try:
+            import os as _os
+            _os.remove(scraper._PW_HARVEST_FILE)
+        except OSError:
+            pass
+        scraper._PW_HARVEST_FILE = old_file
+    print("harvested-session roundtrip (store/persist/reload/jar): OK")
+
+
+def test_pw_fetch_disabled_or_sessionless_is_safe():
+    """The pure-API rung must be a no-op (return None) when disabled or when
+    no harvested session exists — never raise, never fabricate."""
+    old = scraper.PW_FETCH_ENABLED
+    try:
+        scraper.PW_FETCH_ENABLED = False
+        assert scraper._fetch_pw_api_profile("anyhandle") is None
+        scraper.PW_FETCH_ENABLED = True
+        scraper._pw_session.update({"cookies": None, "lsd": "", "doc_id": "", "ua": "", "ts": 0.0})
+        assert scraper._fetch_pw_api_profile("anyhandle") is None
+    finally:
+        scraper.PW_FETCH_ENABLED = old
+    print("pure-API rung safe when disabled/sessionless: OK")
+
+
+def test_profession_pipeline_offline():
+    """The 4-step profession+location pipeline on cached real data only:
+    bio keyword fallback understands the account, curated-pool candidates
+    flow through the REAL fetch/verify ladder, scoring + match_reason are
+    attached, and the input handle is excluded. Zero external calls."""
+    async def run():
+        # Seed the disk cache with a Noida dermatologist + two rivals.
+        scraper._profile_cache.clear()
+        main_p = _make_profile("noida_skin_clinic", followers=8000)
+        main_p.full_name = "Noida Skin Clinic"
+        main_p.bio = "Dermatologist in Noida, Uttar Pradesh. Skin & hair treatments. Book a consultation."
+        scraper._disk_profile_set("noida_skin_clinic", main_p)
+
+        r1 = _make_profile("dr_skin_noida", followers=15000)
+        r1.full_name = "Dr Skin — Dermatologist Noida"
+        r1.bio = "Dermatologist, Noida. Acne, hairfall, laser treatments."
+        r1.recent_posts[0].posted_days_ago = 2
+        scraper._disk_profile_set("dr_skin_noida", r1)
+
+        r2 = _make_profile("city_gym_noida", followers=9000)
+        r2.full_name = "City Gym Noida"
+        r2.bio = "Best gym in Noida. Personal training."
+        scraper._disk_profile_set("city_gym_noida", r2)
+
+        rows, meta = await scraper.discover_profession_competitors("noida_skin_clinic", limit=5)
+        return rows, meta, r1, r2
+
+    old_provider = scraper._CANDIDATE_PROVIDER
+    try:
+        scraper._CANDIDATE_PROVIDER = "pool"  # offline provider only
+        rows, meta, r1, r2 = asyncio.run(run())
+    finally:
+        scraper._CANDIDATE_PROVIDER = old_provider
+
+    # Either the LLM or the bio-keyword fallback may have run — both must
+    # detect dermatologist + Noida from the seeded bio text.
+    assert meta["understanding_source"] in ("llm", "keywords"), meta
+    assert (meta.get("profession") or "").lower() == "dermatologist", meta
+    assert (meta.get("city") or "").lower() == "noida", meta
+    assert meta.get("location_detected") is True
+    names = {r["username"] for r in rows}
+    assert "noida_skin_clinic" not in names, "input handle must be excluded"
+    # Both candidates flow through verification; the gym may be dropped by
+    # the profession check — but a matched dermatologist must survive.
+    assert "dr_skin_noida" in names, f"matched rival missing: {names}"
+    for r in rows:
+        assert isinstance(r.get("match_score"), int) and 0 <= r["match_score"] <= 100
+        assert r.get("match_reason")
+        assert r.get("city") in ("Noida", None)
+    # Ranking among the SEEDED rows: the dermatologist (profession+city
+    # match) must outrank the gym (wrong profession) — and the gym must be
+    # gone entirely if the profession gate dropped it. The cache may also
+    # hold real accounts from live use; if such a row outranks the seed it
+    # must itself be a viable, verified row (the gate below guarantees it).
+    seeded = {r["username"]: r for r in rows if r["username"] in {"dr_skin_noida", "city_gym_noida"}}
+    assert "dr_skin_noida" in seeded
+    if "city_gym_noida" in seeded:
+        assert seeded["dr_skin_noida"]["match_score"] > seeded["city_gym_noida"]["match_score"]
+    # Viability gate: every returned row is researchable (audience + content).
+    for r in rows:
+        assert r["followers"] >= 100, r
+    print("profession+location pipeline (offline, real data): OK")
+
+
+def test_pw_status_is_fail():
+    """Instagram's app-level refusal shapes are recognized (HTTP 200 but
+    status fail), and success shapes are not flagged."""
+    assert scraper._pw_status_is_fail({"status": "fail", "message": "please wait"})
+    assert scraper._pw_status_is_fail({"meta": {"status": "fail"}})
+    assert not scraper._pw_status_is_fail({"status": "ok", "data": {"user": {}}})
+    assert not scraper._pw_status_is_fail(None)
+    assert not scraper._pw_status_is_fail("nonsense")
+    print("status-fail interception shapes: OK")
+
+
+def test_pw_auto_reextract_on_refusal():
+    """400/403/status-fail interception: the cached session is invalidated,
+    a fresh session is auto-extracted, and the SAME request is retried —
+    total exactly 2 attempts (1 + 1 retry). All with a mocked HTTP layer."""
+    old_file = scraper._PW_HARVEST_FILE
+    real_ensure = scraper._pw_ensure_session
+    real_post = scraper._pw_graphql_post
+    try:
+        scraper._PW_HARVEST_FILE = old_file + ".sanity_tmp"
+        calls = {"n": 0}
+
+        def fake_post(doc_id, username, headers, cookies, lsd, raw_body=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 403, None  # cached session refused by Instagram
+            return 200, {  # fresh tokens work
+                "data": {"user": {
+                    "username": "retryuser",
+                    "follower_count": 4321,
+                    "edge_owner_to_timeline_media": {"edges": []},
+                }},
+                "status": "ok",
+            }
+
+        def fake_ensure(force=False):
+            # Simulates a successful headless re-extraction (with template).
+            scraper._store_pw_session(
+                [{"name": "csrftoken", "value": "fresh", "domain": ".instagram.com", "path": "/"}],
+                "fresh-lsd", "23996118476800820", "FreshUA/2.0",
+                template={"headers": {"user-agent": "FreshUA/2.0"},
+                          "body": "av=0&doc_id=23996118476800820"
+                                  "&variables=%7B%22username%22%3A%22seed%22%7D"},
+            )
+            return True
+
+        scraper._pw_graphql_post = fake_post
+        scraper._pw_ensure_session = fake_ensure
+        # Seed the STALE session that Instagram will refuse. The template is
+        # required so the GraphQL POST path (the mocked call) is exercised.
+        scraper._store_pw_session(
+            [{"name": "csrftoken", "value": "stale", "domain": ".instagram.com", "path": "/"}],
+            "stale-lsd", "23996118476800820", "StaleUA/1.0",
+            template={"headers": {"user-agent": "StaleUA/1.0"},
+                      "body": "av=0&doc_id=23996118476800820"
+                              "&variables=%7B%22username%22%3A%22seed%22%7D"},
+        )
+        p = scraper._fetch_pw_api_profile("retryuser")
+        assert p is not None, "retry with fresh tokens must succeed"
+        assert p.username == "retryuser" and p.followers == 4321
+        assert calls["n"] == 2, f"expected exactly 2 attempts (refuse + retry), got {calls['n']}"
+    finally:
+        scraper._pw_graphql_post = real_post
+        scraper._pw_ensure_session = real_ensure
+        scraper._pw_session.update({"cookies": None, "lsd": "", "doc_id": "", "ua": "", "ts": 0.0})
+        try:
+            import os as _os
+            _os.remove(scraper._PW_HARVEST_FILE)
+        except OSError:
+            pass
+        scraper._PW_HARVEST_FILE = old_file
+    print("auto re-extract + retry on 403 refusal: OK")
+
+
 def _cleanup_test_rows():
     """Remove test rows so the real-data cache stays tidy."""
     import sqlite3
@@ -307,5 +512,11 @@ if __name__ == "__main__":
     asyncio.run(test_live_mode_honest_error_when_all_providers_fail())
     test_local_discovery()
     test_no_demo_machinery()
+    test_pw_doc_id_extraction()
+    test_pw_session_roundtrip()
+    test_pw_fetch_disabled_or_sessionless_is_safe()
+    test_pw_status_is_fail()
+    test_pw_auto_reextract_on_refusal()
+    test_profession_pipeline_offline()
     _cleanup_test_rows()
     print("\nAll offline checks passed.")

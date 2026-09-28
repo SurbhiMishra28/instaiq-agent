@@ -58,6 +58,14 @@ class ProfileMetrics(BaseModel):
     comments_by_format: Optional[dict] = None  # {combined,posts,reels} -> {count,total_comments,avg_comments}
 
 
+class MetricVerdictOut(BaseModel):
+    """One metric + plain-language verdict (Simple view)."""
+    metric: str
+    value: str
+    verdict: str            # Good | Okay | Needs work
+    plain: str
+
+
 class ProfileInsight(BaseModel):
     profile: ProfileData
     metrics: ProfileMetrics
@@ -66,6 +74,17 @@ class ProfileInsight(BaseModel):
     weaknesses: List[str]
     recommendations: List[str]
     account_score: Optional[int] = None  # 0-100, computed from real data (size-aware)
+    # Beginner-first fields (Simple view): plain metric verdicts + the
+    # 'Top 3 things to do this week' checklist. Always populated — the
+    # rule-based engine guarantees them when the LLM is unavailable.
+    metric_verdicts: List[MetricVerdictOut] = []
+    top_actions: List[str] = []
+    # Profession+location match metadata attached to rival readouts by the
+    # discovery pipeline (None on the main account / legacy flows).
+    profession: Optional[str] = None
+    specialty: Optional[str] = None
+    city: Optional[str] = None
+    match_reason: Optional[str] = None
 
 
 class AnalyzeRequest(BaseModel):
@@ -97,6 +116,12 @@ class DiscoveredCompetitor(BaseModel):
     followers: int = 0
     verified: bool = False
     private: bool = False
+    # --- profession + location discovery (4-step pipeline) ---
+    profession: Optional[str] = None      # e.g. "doctor"
+    specialty: Optional[str] = None       # e.g. "dermatologist"
+    city: Optional[str] = None            # e.g. "Noida" (None = undetected)
+    match_reason: Optional[str] = None    # "Dermatologist in Noida, 2.1x your followers, posts 4x/week"
+    match_score: Optional[int] = None     # 0-100 relevance score
 
 
 class CompetitorResearchResponse(BaseModel):
@@ -111,6 +136,10 @@ class CompetitorResearchResponse(BaseModel):
     ranking: List[str]
     warnings: List[str] = []
     candidates_found: int = 0
+    # None = profession discovery never ran (legacy related-accounts path);
+    # False = ran but the city was undetected -> UI shows the
+    # "profession-wide matches" notice; True = city-aware matches.
+    location_detected: Optional[bool] = None
 
 
 class GrowthPlanResponse(BaseModel):

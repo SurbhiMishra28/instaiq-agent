@@ -40,7 +40,7 @@ is built honestly around that constraint:
   Scraper actor (when `APIFY_TOKEN` is set), or — with zero credentials —
   the **keyless direct Instagram HTTP layer**: bootstrapped browser-like
   headers + cookies, then Instagram's own `web_profile_info` / GraphQL
-  endpoints over plain HTTP (no browser, no Playwright, no tokens).
+  endpoints over plain HTTP (no browser needed).
   Followers, bio, verification, and the 12 most
   recent posts with real likes, comments, timestamps and media types.
   When Instagram hard-throttles the host's IP (401/login-wall on every
@@ -49,6 +49,14 @@ is built honestly around that constraint:
   auto-detected) and parses the real page — exact stats from the embedded
   Relay JSON, plus best-effort in-page API/feed calls for post engagement.
   Zero credentials at every stage.
+  When the Apify pool is exhausted/benched AND plain HTTP is throttled, a
+  **Playwright session-harvest rung** (optional, `requirements-playwright.txt`)
+  opens ONE randomized-UA headless page, intercepts the page's own outbound
+  traffic to capture Instagram's API session parameters (`doc_id`, `lsd`,
+  `csrftoken` + cookies), caches them for 12 h (memory + `ig_session.json`),
+  and then serves every profile as a cheap pure-API call — no browser render
+  per profile. HTTP 400/403/429 or `{"status": "fail"}` invalidates the
+  session, auto-re-extracts fresh tokens headlessly, and retries once.
   Failures are honest errors (400 = handle does not exist, 503 = every
   provider blocked); simulated/demo data does not exist in this system.
 

@@ -1,5 +1,8 @@
 .vercel
 .env*
+ig_session.json
+playwright-report/
+test-results/
 data/collect/
 backend/rag_index.db
 *.db

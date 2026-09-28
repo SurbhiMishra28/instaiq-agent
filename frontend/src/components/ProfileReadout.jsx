@@ -117,13 +117,31 @@ function CompactReadout({ profile, metrics }) {
 }
 
 /* Full mode: standalone card used for rival readouts in competitor research. */
-function FullReadout({ profile, metrics }) {
+function FullReadout({ profile, metrics, match }) {
   return (
     <div className="readout">
       <div className="profile-id">
         <p className="handle">
           @{profile.username}
           {profile.is_verified && <span className="badge">VERIFIED</span>}
+          {match?.city && (
+            <span
+              title={`Matched in ${match.city}`}
+              style={{
+                marginLeft: 6,
+                fontSize: 10,
+                fontWeight: 700,
+                color: '#0F1115',
+                background: 'var(--signal, #4EC9FF)',
+                borderRadius: 8,
+                padding: '2px 7px',
+                verticalAlign: 'middle',
+                letterSpacing: '0.4px',
+              }}
+            >
+              {match.city.toUpperCase()}
+            </span>
+          )}
           {profile.data_age_hours === -1 && (
             <span
               title="No cached real data exists for this handle yet — all numbers below are SIMULATED so the analysis still works. They are NOT real Instagram statistics."
@@ -162,6 +180,20 @@ function FullReadout({ profile, metrics }) {
         </p>
         <p className="category">{profile.category}</p>
         <p className="bio">{profile.bio}</p>
+        {match?.match_reason && (
+          <p
+            className="match-reason"
+            title="Why this account is a competitor for you"
+            style={{
+              margin: '8px 0 0',
+              fontSize: 12.5,
+              fontStyle: 'italic',
+              color: 'var(--signal, #4EC9FF)',
+            }}
+          >
+            ↳ {match.match_reason}
+          </p>
+        )}
         <div className="hashtag-row">
           {metrics.top_hashtags.map((h) => (
             <span className="hashtag-chip" key={h}>{h}</span>
@@ -229,9 +261,13 @@ function FullReadout({ profile, metrics }) {
 export default function ProfileReadout({ insight, compact = false }) {
   if (!insight) return null;
   const { profile, metrics } = insight;
+  const match = {
+    city: insight.city,
+    match_reason: insight.match_reason,
+  };
   return compact
     ? <CompactReadout profile={profile} metrics={metrics} />
-    : <FullReadout profile={profile} metrics={metrics} />;
+    : <FullReadout profile={profile} metrics={metrics} match={match} />;
 }
 
 /* Standalone per-post table with the avg calculation shown explicitly —

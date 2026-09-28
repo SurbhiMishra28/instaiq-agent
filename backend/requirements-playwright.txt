@@ -1,0 +1,19 @@
+# OPTIONAL dependency set — Playwright session harvest (Provider #2c).
+#
+# This rung spends ONE headless-browser page load to harvest Instagram's own
+# API session parameters (doc_id / lsd / csrftoken) from the page's outbound
+# traffic, then scrapes every profile afterwards at the pure API level —
+# no browser render per profile. It kicks in automatically when the Apify
+# token pool is exhausted/benched and the plain-HTTP direct ladder is
+# throttled (401/429).
+#
+# The core backend does NOT require these packages: without them the rung
+# skips gracefully and the ladder falls through to the Tavily floor.
+#
+# Install:
+#   pip install -r requirements-playwright.txt
+#   playwright install chromium
+#
+# Disable the rung entirely with IG_PW_FETCH=false.
+
+playwright==1.49.1

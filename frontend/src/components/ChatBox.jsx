@@ -9,6 +9,17 @@ export default function ChatBox({ context }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
+  // The PWA install banner is a full-width z-index-1100 bar at the same
+  // bottom-right corner as the chat FAB — while it is up, the FAB (z 1001)
+  // is physically unclickable. Lift FAB + panel above the banner until it
+  // is dismissed (the banner announces itself on window 'pwa-banner').
+  const [bannerUp, setBannerUp] = useState(() => !!window.__pwaBannerVisible);
+  useEffect(() => {
+    const on = (e) => setBannerUp(!!(e.detail && e.detail.visible));
+    window.addEventListener('pwa-banner', on);
+    return () => window.removeEventListener('pwa-banner', on);
+  }, []);
+  const lift = bannerUp ? 72 : 0; // px to raise bottom offsets + stacking
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -90,7 +101,7 @@ export default function ChatBox({ context }) {
         onClick={() => setOpen(!open)}
         style={{
           position: 'fixed',
-          bottom: 20,
+          bottom: 20 + lift,
           right: 20,
           width: 52,
           height: 52,
@@ -104,7 +115,7 @@ export default function ChatBox({ context }) {
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          zIndex: 1001,
+          zIndex: bannerUp ? 1101 : 1001,
           transition: 'transform 0.15s ease',
         }}
         aria-label="Open chat"
@@ -116,7 +127,7 @@ export default function ChatBox({ context }) {
       {open && (
         <div style={{
           position: 'fixed',
-          bottom: 84,
+          bottom: 84 + lift,
           right: 20,
           width: 340,
           maxHeight: 460,
@@ -127,7 +138,7 @@ export default function ChatBox({ context }) {
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
-          zIndex: 1001,
+          zIndex: bannerUp ? 1101 : 1001,
         }}>
           {/* Header */}
           <div style={{

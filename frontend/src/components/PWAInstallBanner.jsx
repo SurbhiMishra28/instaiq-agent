@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react';
 
+// Lift value for floating UI while the banner is up (banner ≈ 56px tall).
+export const PWA_BANNER_LIFT = 72;
+
 export default function PWAInstallBanner() {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [show, setShow] = useState(false);
@@ -13,6 +16,20 @@ export default function PWAInstallBanner() {
     window.addEventListener('beforeinstallprompt', handler);
     return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
+
+  // Publish visibility so floating UI (chat FAB sits at the same bottom-right
+  // corner) can lift itself out from under this full-width banner. The banner
+  // is z-index 1100 — anything interactive underneath it is unclickable.
+  // State goes on window too: the FAB may mount AFTER this event fired and
+  // would otherwise miss it.
+  useEffect(() => {
+    window.__pwaBannerVisible = show;
+    window.dispatchEvent(new CustomEvent('pwa-banner', { detail: { visible: show } }));
+    return () => {
+      window.__pwaBannerVisible = false;
+      window.dispatchEvent(new CustomEvent('pwa-banner', { detail: { visible: false } }));
+    };
+  }, [show]);
 
   const install = async () => {
     if (!deferredPrompt) return;
